@@ -42,6 +42,20 @@ MinHash LSH
     :members:
     :special-members:
 
+MinHash LSH Parameter Calibration
+---------------------------------
+
+.. autofunction:: datasketch.calibrate_lsh_params
+
+.. autoclass:: datasketch.CalibrationSample
+    :members:
+
+.. autoclass:: datasketch.ParameterEvaluation
+    :members:
+
+.. autoclass:: datasketch.CalibrationResult
+    :members:
+
 Asynchronous MinHash LSH
 ------------------------
 
