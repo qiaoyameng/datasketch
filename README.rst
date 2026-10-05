@@ -38,6 +38,8 @@ This package contains the following data sketches:
 +-------------------------+-----------------------------------------------+
 | `HyperLogLog++`_        | estimate cardinality                          |
 +-------------------------+-----------------------------------------------+
+| `KMV`_                  | estimate cardinality and Jaccard similarity   |
++-------------------------+-----------------------------------------------+
 
 The following indexes for data sketches are provided to support
 sub-linear query time:
@@ -94,6 +96,7 @@ To install with Bloom filter dependency:
 .. _`Weighted MinHash`: https://ekzhu.github.io/datasketch/weightedminhash.html
 .. _`HyperLogLog`: https://ekzhu.github.io/datasketch/hyperloglog.html
 .. _`HyperLogLog++`: https://ekzhu.github.io/datasketch/hyperloglog.html#hyperloglog-plusplus
+.. _`KMV`: https://ekzhu.github.io/datasketch/kmv.html
 .. _`MinHash LSH`: https://ekzhu.github.io/datasketch/lsh.html
 .. _`MinHash LSH Forest`: https://ekzhu.github.io/datasketch/lshforest.html
 .. _`MinHash LSH Ensemble`: https://ekzhu.github.io/datasketch/lshensemble.html

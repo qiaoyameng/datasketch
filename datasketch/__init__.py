@@ -12,6 +12,7 @@ from datasketch.b_bit_minhash import bBitMinHash
 from datasketch.hashfunc import sha1_hash32, sha1_hash64
 from datasketch.hnsw import HNSW
 from datasketch.hyperloglog import HyperLogLog, HyperLogLogPlusPlus
+from datasketch.kmv import KMV, KMinimumValues
 from datasketch.lean_minhash import LeanMinHash
 from datasketch.lsh import MinHashLSH
 from datasketch.lsh_bloom import MinHashLSHBloom
@@ -26,6 +27,8 @@ WeightedMinHashLSHForest = MinHashLSHForest
 
 __all__ = [
     "HNSW",
+    "KMV",
+    "KMinimumValues",
     "AsyncMinHashLSH",
     "HyperLogLog",
     "HyperLogLogPlusPlus",

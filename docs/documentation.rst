@@ -84,6 +84,13 @@ HyperLogLog++
     :members:
     :special-members:
 
+KMV
+---
+
+.. autoclass:: datasketch.KMV
+    :members:
+    :special-members:
+
 
 HNSW
 ----
