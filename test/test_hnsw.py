@@ -1,10 +1,12 @@
 import unittest
 import warnings
+from collections import OrderedDict
 
 import numpy as np
 import pytest
 
 from datasketch.hnsw import HNSW
+from datasketch.hnsw import _Layer, _Node
 from datasketch.minhash import MinHash
 
 
@@ -249,6 +251,192 @@ class TestHNSW(unittest.TestCase):
         self.assertRaises(KeyError, hnsw.__getitem__, 0)
         self.assertRaises(KeyError, hnsw.popitem)
         self.assertRaises(ValueError, hnsw.query, data[0])
+
+    def _build_bridge_index(self):
+        # A tiny graph in 1-D: E (the entry point) is connected only to B,
+        # which in turn connects to T. The query is at 0, so the nearest
+        # qualified answer T is reachable only by navigating through B.
+        hnsw = HNSW(distance_func=l2_distance, m=16, ef_construction=10, seed=1)
+        points = {"E": 10.0, "B": 1.0, "T": 2.0}
+        hnsw._nodes = OrderedDict((key, _Node(key, np.array(value))) for key, value in points.items())
+        layer = _Layer("E")
+        layer["E"] = {"B": l2_distance(np.array(10.0), np.array(1.0))}
+        layer["B"] = {
+            "E": l2_distance(np.array(1.0), np.array(10.0)),
+            "T": l2_distance(np.array(1.0), np.array(2.0)),
+        }
+        layer["T"] = {"B": l2_distance(np.array(2.0), np.array(1.0))}
+        hnsw._graphs = [layer]
+        hnsw._entry_point = "E"
+        return hnsw
+
+    def test_filter_navigates_through_rejected_nodes(self):
+        hnsw = self._build_bridge_index()
+        query = np.array(0.0)
+        # T is the only allowed key and is reachable solely via B, which the
+        # filter rejects. It must still be found.
+        results, exhausted = hnsw.query(
+            query,
+            k=1,
+            ef=10,
+            filter_func=lambda key: key == "T",
+            return_exhausted=True,
+        )
+        self.assertEqual(results, [("T", l2_distance(query, np.array(2.0)))])
+        self.assertFalse(exhausted)
+
+    def test_filter_only_returns_allowed_keys(self):
+        hnsw = self._build_bridge_index()
+        query = np.array(0.0)
+        results = hnsw.query(
+            query,
+            k=5,
+            ef=10,
+            filter_func=lambda key: key in ("E", "B"),
+        )
+        self.assertEqual([key for key, _ in results], ["B", "E"])
+        for j in range(len(results) - 1):
+            self.assertLessEqual(results[j][1], results[j + 1][1])
+
+    def test_filter_returns_actual_count_when_fewer_than_k(self):
+        hnsw = self._build_bridge_index()
+        query = np.array(0.0)
+        results, exhausted = hnsw.query(
+            query,
+            k=10,
+            ef=10,
+            filter_func=lambda key: key == "T",
+            return_exhausted=True,
+        )
+        self.assertEqual(results, [("T", l2_distance(query, np.array(2.0)))])
+        self.assertFalse(exhausted)
+
+    def test_filter_empty_qualified_set(self):
+        hnsw = self._build_bridge_index()
+        results = hnsw.query(np.array(0.0), k=5, ef=10, filter_func=lambda key: False)
+        self.assertEqual(results, [])
+        results, exhausted = hnsw.query(
+            np.array(0.0),
+            k=5,
+            ef=10,
+            filter_func=lambda key: False,
+            return_exhausted=True,
+        )
+        self.assertEqual(results, [])
+        # The whole connected graph is explored within the budget.
+        self.assertFalse(exhausted)
+
+    def test_filter_k_zero(self):
+        hnsw = self._build_bridge_index()
+        self.assertEqual(hnsw.query(np.array(0.0), k=0, ef=10, filter_func=lambda key: True), [])
+
+    def test_filter_exhausted_budget(self):
+        hnsw = self._build_bridge_index()
+        # ef=1 lets only the entry point E be explored, so k=3 cannot be met.
+        results, exhausted = hnsw.query(
+            np.array(0.0),
+            k=3,
+            ef=1,
+            filter_func=lambda key: True,
+            return_exhausted=True,
+        )
+        self.assertTrue(exhausted)
+        self.assertLess(len(results), 3)
+
+    def test_filter_exhausted_budget_large_graph(self):
+        rng = np.random.RandomState(99)
+        data = rng.rand(500, 8)
+        hnsw = HNSW(distance_func=l2_distance, m=8, ef_construction=100, seed=11)
+        for key, point in enumerate(data):
+            hnsw.insert(key, point)
+        query = rng.rand(8)
+        results, exhausted = hnsw.query(
+            query,
+            k=50,
+            ef=1,
+            filter_func=lambda key: True,
+            return_exhausted=True,
+        )
+        self.assertTrue(exhausted)
+        self.assertLess(len(results), 50)
+        results, exhausted = hnsw.query(
+            query,
+            k=10,
+            ef=500,
+            filter_func=lambda key: True,
+            return_exhausted=True,
+        )
+        self.assertEqual(len(results), 10)
+        self.assertFalse(exhausted)
+
+    def test_filter_matches_brute_force(self):
+        rng = np.random.RandomState(2024)
+        n, dim = 200, 6
+        data = rng.rand(n, dim)
+        hnsw = HNSW(distance_func=l2_distance, m=8, ef_construction=100, seed=5)
+        for key, point in enumerate(data):
+            hnsw.insert(key, point)
+        tenant_of = {key: key % 4 for key in range(n)}
+        for _ in range(20):
+            query = rng.rand(dim)
+            allowed_tenants = set(rng.choice(4, size=int(rng.randint(1, 5)), replace=False).tolist())
+            allowed = {key for key in range(n) if tenant_of[key] in allowed_tenants}
+            k = 7
+            results = hnsw.query(
+                query,
+                k=k,
+                ef=n,
+                filter_func=lambda key: key in allowed,
+            )
+            expected = sorted((l2_distance(query, data[key]), key) for key in allowed)[:k]
+            self.assertEqual(
+                [(key, dist) for dist, key in expected],
+                results,
+            )
+            self.assertTrue(all(key in allowed for key, _ in results))
+            self.assertLessEqual(len(results), k)
+
+    def test_filter_soft_deleted_nodes_traversed_but_not_returned(self):
+        rng = np.random.RandomState(7)
+        data = rng.rand(40, 3)
+        hnsw = HNSW(distance_func=l2_distance, m=6, ef_construction=60, seed=3)
+        for key, point in enumerate(data):
+            hnsw.insert(key, point)
+        query = rng.rand(3)
+        allowed = {2, 17, 31}
+        hnsw.remove(17)
+        results = hnsw.query(query, k=10, ef=40, filter_func=lambda key: key in allowed)
+        self.assertTrue(all(key != 17 for key, _ in results))
+        expected = sorted((l2_distance(query, data[key]), key) for key in (2, 31))
+        self.assertEqual(results, [(key, dist) for dist, key in expected])
+
+    def test_no_filter_preserves_behavior(self):
+        data = self._create_random_points()
+        hnsw = self._create_index(data)
+        for i in (0, 10, 50):
+            plain = hnsw.query(data[i], k=10)
+            flagged, exhausted = hnsw.query(data[i], k=10, return_exhausted=True)
+            self.assertEqual(plain, flagged)
+            self.assertFalse(exhausted)
+
+    def test_equal_distances_with_incomparable_keys(self):
+        # str and tuple keys raise TypeError when compared; equal distances
+        # must never force such a comparison during search or sorting.
+        hnsw = HNSW(distance_func=l2_distance, m=4, ef_construction=20, seed=7)
+        points = {
+            "a": np.array([1.0]),
+            "b": np.array([-1.0]),
+            (1,): np.array([1.0]),
+            (2,): np.array([-1.0]),
+            "z": np.array([0.5]),
+            "y": np.array([-0.5]),
+        }
+        for key, point in points.items():
+            hnsw.insert(key, point)
+        query = np.array([0.0])
+        self.assertEqual(len(hnsw.query(query, k=6, ef=50)), 6)
+        self.assertEqual(len(hnsw.query(query, k=4, ef=50, filter_func=lambda key: True)), 4)
+        self.assertEqual(len(hnsw.query(query, k=None, ef=50)), 6)
 
 
 class TestHNSWLayerWithReversedEdges(TestHNSW):
