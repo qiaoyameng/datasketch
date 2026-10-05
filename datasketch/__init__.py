@@ -18,7 +18,7 @@ from datasketch.lsh_bloom import MinHashLSHBloom
 from datasketch.lshensemble import MinHashLSHEnsemble
 from datasketch.lshforest import MinHashLSHForest
 from datasketch.minhash import MinHash
-from datasketch.weighted_minhash import WeightedMinHash, WeightedMinHashGenerator
+from datasketch.weighted_minhash import UpdatableWeightedMinHash, WeightedMinHash, WeightedMinHashGenerator
 
 # Alias
 WeightedMinHashLSH = MinHashLSH
@@ -35,6 +35,7 @@ __all__ = [
     "MinHashLSHBloom",
     "MinHashLSHEnsemble",
     "MinHashLSHForest",
+    "UpdatableWeightedMinHash",
     "WeightedMinHash",
     "WeightedMinHashGenerator",
     "WeightedMinHashLSH",

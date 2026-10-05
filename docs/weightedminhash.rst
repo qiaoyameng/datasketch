@@ -57,6 +57,29 @@ this makes the cost of ``update`` increase linearly with respect to the
 weight. Thus, ``update`` is not implemented for :class:`datasketch.WeightedMinHash` in
 this library.
 
+If a weighted vector changes in only a few dimensions, use
+:class:`datasketch.UpdatableWeightedMinHash` instead. It shares the same
+``dim``, ``sample_size``, ``seed``, and random parameters as
+:class:`WeightedMinHashGenerator`, and supports increasing, decreasing, and
+zeroing one nonnegative weight. When a current sample winner is removed or
+becomes worse, the retained candidates for the other dimensions are used to
+select the replacement winner.
+
+Updating a dimension computes only one candidate column, but retaining all
+candidates requires ``2 * sample_size * dim`` float32 values in addition to
+the generator's ``3 * sample_size * dim`` float32 random values. The updatable
+summary therefore uses ``O(sample_size * dim)`` memory, not the fixed
+``O(sample_size)`` digest size of a regular :class:`WeightedMinHash`.
+
+.. code:: python
+
+    v = np.array([1.0, 0.0, 4.0, 0.0], dtype=np.float32)
+    sketch = wmg.updatable_minhash(v)
+    sketch.update(1, 3)       # Add or increase one weight
+    sketch.update(2, 2)       # Decrease one weight
+    sketch.update(2, 0)       # Remove a dimension
+    m = sketch.minhash()      # None if every weight is zero
+
 Weighted MinHash as similar accuracy and performance profiles as
 MinHash. As you increase the number of samples, you get better accuracy,
 at the expense of slower speed.
@@ -88,4 +111,3 @@ can also be used to index :class:`datasketch.WeightedMinHash`.
     lsh.insert("m3", m3)
     result = lsh.query(m1)
     print("Approximate neighbours with weighted Jaccard similarity > 0.1", result)
-

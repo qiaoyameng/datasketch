@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections.abc
 import copy
+import operator
 from typing import Union
 
 import numpy as np
@@ -158,6 +159,18 @@ class WeightedMinHashGenerator:
             hashvalues[i][0], hashvalues[i][1] = k, int(t[k])
         return WeightedMinHash(self.seed, hashvalues)
 
+    def updatable_minhash(self, v: np.ndarray) -> UpdatableWeightedMinHash:
+        """Create a new :class:`UpdatableWeightedMinHash` given a weighted
+        Jaccard vector.
+
+        Args:
+            v (numpy.ndarray): The Jaccard vector.
+
+        Returns:
+            UpdatableWeightedMinHash: The updatable weighted MinHash.
+        """
+        return UpdatableWeightedMinHash(self, v)
+
     def minhash_many(self, X: Union[sp.sparse.spmatrix, np.ndarray]) -> list[Union[WeightedMinHash, None]]:
         """Create new WeightedMinHash instances given a matrix of weighted
         Jaccard vectors. In the input matrix X, each row corresponds to a
@@ -245,3 +258,224 @@ class WeightedMinHashGenerator:
                 ret[it_doc] = WeightedMinHash(self.seed, hashvalues)
 
         return ret
+
+
+class UpdatableWeightedMinHash:
+    """Updatable weighted MinHash state for a fixed dimension vector.
+
+    A :class:`WeightedMinHash` only stores the winning dimension and sampled
+    weight bucket for each sample. This object also stores the candidate score
+    and bucket for every other dimension, so a dimension can be increased,
+    decreased, or set to zero without regenerating the generator's random
+    parameters or recomputing unchanged dimensions.
+
+    The candidate state uses :code:`2 * sample_size * dim` float32 values, in
+    addition to the generator's :code:`3 * sample_size * dim` float32 random
+    values. Its memory is therefore :math:`O(sample_size \\times dim)`, not the
+    fixed :math:`O(sample_size)` digest size of :class:`WeightedMinHash`.
+
+    Args:
+        generator (WeightedMinHashGenerator): The generator providing the
+            random parameters and seed.
+        v (numpy.ndarray): The initial nonnegative Jaccard vector.
+    """
+
+    def __init__(self, generator: WeightedMinHashGenerator, v: np.ndarray) -> None:
+        if not isinstance(generator, WeightedMinHashGenerator):
+            raise TypeError("generator must be a WeightedMinHashGenerator")
+        self._generator = generator
+        self.seed = generator.seed
+        self.dim = generator.dim
+        self.sample_size = generator.sample_size
+
+        weights = _validate_vector(v, self.dim)
+        candidate_t, candidate_ln_a, hashvalues = _build_candidates(generator, weights)
+        self._weights = weights
+        self._candidate_t = candidate_t
+        self._candidate_ln_a = candidate_ln_a
+        self._hashvalues = hashvalues
+        self._nonzero_count = int(np.count_nonzero(self._weights))
+
+    @property
+    def is_empty(self) -> bool:
+        """bool: Whether all dimensions currently have zero weight."""
+        return self._nonzero_count == 0
+
+    def weights(self) -> np.ndarray:
+        """Return a copy of the current nonnegative weight vector.
+
+        Returns:
+            numpy.ndarray: The current weights.
+        """
+        return self._weights.copy()
+
+    def update(self, dimension: int, weight: float) -> None:
+        """Set one dimension to a new nonnegative weight.
+
+        Only the candidate column for the selected dimension is recomputed. If
+        that dimension is a current sample winner, the stored candidates are
+        used to select the replacement winner.
+
+        Args:
+            dimension (int): The dimension to update.
+            weight (float): The new finite, nonnegative weight. A weight of
+                zero removes the dimension.
+
+        Raises:
+            ValueError: If the dimension or weight is invalid.
+        """
+        try:
+            index = operator.index(dimension)
+        except TypeError as exc:
+            raise ValueError("dimension must be an integer") from exc
+        if not 0 <= index < self.dim:
+            raise ValueError("dimension %d is outside [0, %d)" % (index, self.dim))
+
+        new_weight = np.asarray(weight, dtype=np.float32)
+        if new_weight.ndim != 0:
+            raise ValueError("weight must be a scalar")
+        if not np.isfinite(new_weight) or new_weight < 0:
+            raise ValueError("weight must be finite and nonnegative")
+
+        old_weight = self._weights[index]
+        if old_weight == new_weight:
+            return
+
+        if new_weight == 0:
+            new_t = np.zeros(self.sample_size, dtype=np.float32)
+            new_ln_a = np.full(self.sample_size, np.inf, dtype=np.float32)
+        else:
+            new_t, new_ln_a = _candidate_column(generator=self._generator, index=index, weight=new_weight)
+
+        new_hashvalues = self._hashvalues.copy()
+        sample_indices = np.arange(self.sample_size)
+        winner_mask = new_hashvalues[:, 0] == index
+
+        if self._nonzero_count == 0:
+            new_hashvalues[:, 0] = index
+            new_hashvalues[:, 1] = new_t.astype(int)
+        else:
+            current_ln_a = self._candidate_ln_a[sample_indices, new_hashvalues[:, 0]]
+            becomes_winner = (new_ln_a < current_ln_a) | (
+                (new_ln_a == current_ln_a) & (index < new_hashvalues[:, 0])
+            )
+            becomes_winner &= ~winner_mask
+            new_hashvalues[becomes_winner, 0] = index
+            new_hashvalues[becomes_winner, 1] = new_t[becomes_winner].astype(int)
+
+            remaining_winner_count = int(np.count_nonzero(winner_mask))
+            if remaining_winner_count:
+                will_be_empty = old_weight > 0 and new_weight == 0 and self._nonzero_count == 1
+                if will_be_empty:
+                    new_hashvalues[winner_mask, :] = 0
+                else:
+                    other_candidates = self._candidate_ln_a[winner_mask].copy()
+                    other_candidates[:, index] = np.inf
+                    winner_rows = np.arange(remaining_winner_count)
+                    replacement_indices = np.argmin(other_candidates, axis=1)
+                    replacement_ln_a = other_candidates[winner_rows, replacement_indices]
+                    column_ln_a = new_ln_a[winner_mask]
+                    choose_column = (column_ln_a < replacement_ln_a) | (
+                        (column_ln_a == replacement_ln_a) & (index < replacement_indices)
+                    )
+
+                    selected_indices = np.where(choose_column, index, replacement_indices)
+                    replacement_t = self._candidate_t[winner_mask][winner_rows, replacement_indices]
+                    selected_t = np.where(choose_column, new_t[winner_mask], replacement_t)
+                    new_hashvalues[winner_mask, 0] = selected_indices
+                    new_hashvalues[winner_mask, 1] = selected_t.astype(int)
+
+        self._weights[index] = new_weight
+        self._candidate_t[:, index] = new_t
+        self._candidate_ln_a[:, index] = new_ln_a
+        self._hashvalues = new_hashvalues
+        if old_weight == 0:
+            self._nonzero_count += 1
+        elif new_weight == 0:
+            self._nonzero_count -= 1
+
+    def minhash(self) -> Union[WeightedMinHash, None]:
+        """Return the current weighted MinHash, or ``None`` if all weights are
+        zero.
+
+        Returns:
+            Union[WeightedMinHash, None]: The current weighted MinHash.
+        """
+        if self.is_empty:
+            return None
+        return WeightedMinHash(self.seed, self._hashvalues.copy())
+
+    def digest(self) -> Union[np.ndarray, None]:
+        """Export the current hash values, or ``None`` if all weights are zero.
+
+        Returns:
+            Union[numpy.ndarray, None]: A copy of the hash values.
+        """
+        if self.is_empty:
+            return None
+        return self._hashvalues.copy()
+
+    def copy(self) -> UpdatableWeightedMinHash:
+        """Returns:
+        UpdatableWeightedMinHash: A copy of this updatable weighted MinHash.
+        """
+        cloned = copy.copy(self)
+        cloned._weights = self._weights.copy()
+        cloned._candidate_t = self._candidate_t.copy()
+        cloned._candidate_ln_a = self._candidate_ln_a.copy()
+        cloned._hashvalues = self._hashvalues.copy()
+        return cloned
+
+    def __len__(self) -> int:
+        """Returns:
+        int: The number of hash values.
+        """
+        return self.sample_size
+
+
+def _validate_vector(v: np.ndarray, dim: int) -> np.ndarray:
+    if not isinstance(v, collections.abc.Sized):
+        raise TypeError("Input vector must be sized")
+    if len(v) != dim:
+        raise ValueError("Input dimension mismatch, expecting %d" % dim)
+    values = np.asarray(v, dtype=np.float32)
+    if values.ndim != 1:
+        raise ValueError("Input vector must be one-dimensional")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Input weights must be finite")
+    if np.any(values < 0):
+        raise ValueError("Input weights must be nonnegative")
+    return values.copy()
+
+
+def _candidate_column(
+    generator: WeightedMinHashGenerator, index: int, weight: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    vlog = np.log(weight)
+    t = np.floor(vlog / generator.rs[:, index] + generator.betas[:, index])
+    ln_y = (t - generator.betas[:, index]) * generator.rs[:, index]
+    ln_a = generator.ln_cs[:, index] - ln_y - generator.rs[:, index]
+    return t, ln_a
+
+
+def _build_candidates(
+    generator: WeightedMinHashGenerator, weights: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    active = weights > 0
+    values = weights.copy()
+    values[~active] = np.nan
+    vlog = np.log(values)
+    t = np.floor(vlog[None, :] / generator.rs + generator.betas)
+    ln_y = (t - generator.betas) * generator.rs
+    ln_a = generator.ln_cs - ln_y - generator.rs
+
+    t[:, ~active] = 0
+    ln_a[:, ~active] = np.inf
+
+    hashvalues = np.zeros((generator.sample_size, 2), dtype=int)
+    if np.any(active):
+        winners = np.argmin(ln_a, axis=1)
+        sample_indices = np.arange(generator.sample_size)
+        hashvalues[:, 0] = winners
+        hashvalues[:, 1] = t[sample_indices, winners].astype(int)
+    return t, ln_a, hashvalues
