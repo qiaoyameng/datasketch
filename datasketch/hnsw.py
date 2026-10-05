@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import heapq
+import json
+import os
+import tempfile
 from collections import OrderedDict
 from collections.abc import Hashable, Iterable, Iterator, Mapping, MutableMapping
 from typing import (
@@ -10,6 +13,239 @@ from typing import (
 )
 
 import numpy as np
+
+# Name and version of the HNSW snapshot format written by
+# :meth:`HNSW.save_snapshot` and read by :meth:`HNSW.load_snapshot`.
+SNAPSHOT_FORMAT_NAME = "datasketch-hnsw-snapshot"
+SNAPSHOT_FORMAT_VERSION = 1
+
+# Safety limits enforced when loading a snapshot. They bound the memory
+# that a malicious or corrupt snapshot can cause to be allocated.
+SNAPSHOT_MAX_DIM = 4096
+SNAPSHOT_MAX_LAYERS = 64
+
+# Point dtypes allowed in a snapshot (version 1).
+_SNAPSHOT_POINT_DTYPES = frozenset({"float32", "float64"})
+
+
+class HNSWSnapshotError(ValueError):
+    """Raised when an HNSW snapshot is invalid, unsupported, or fails
+    validation. Loading a snapshot that raises this error never produces
+    a partially loaded index.
+    """
+
+
+def _encode_snapshot_key(key: Hashable) -> dict:
+    """Encode a key for the snapshot format. Version 1 supports only
+    strings and integers with explicit type tags.
+    """
+    if isinstance(key, bool):
+        raise TypeError(
+            "HNSW snapshot format version 1 does not support bool keys; "
+            "only str and int keys are supported."
+        )
+    if isinstance(key, int):
+        return {"type": "int", "value": key}
+    if isinstance(key, str):
+        return {"type": "str", "value": key}
+    raise TypeError(
+        f"HNSW snapshot format version 1 supports only str and int keys, "
+        f"got key of type {type(key).__name__!r}."
+    )
+
+
+def _decode_snapshot_key(entry: object) -> Hashable:
+    """Decode a key from a snapshot, enforcing the explicit type tag."""
+    if not isinstance(entry, dict):
+        raise HNSWSnapshotError(f"Invalid key entry in snapshot: {entry!r}.")
+    key_type = entry.get("type")
+    value = entry.get("value")
+    if key_type == "int":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise HNSWSnapshotError(f"Invalid int key entry in snapshot: {entry!r}.")
+        return value
+    if key_type == "str":
+        if not isinstance(value, str):
+            raise HNSWSnapshotError(f"Invalid str key entry in snapshot: {entry!r}.")
+        return value
+    raise HNSWSnapshotError(f"Unsupported key type in snapshot: {key_type!r}.")
+
+
+def _snapshot_expect_int(value: object, name: str, minimum: int, maximum: Optional[int] = None) -> int:
+    """Validate that a snapshot metadata field is an integer in range."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HNSWSnapshotError(f"Snapshot field {name!r} must be an integer, got {value!r}.")
+    if value < minimum or (maximum is not None and value > maximum):
+        raise HNSWSnapshotError(f"Snapshot field {name!r} is out of range: {value!r}.")
+    return value
+
+
+def _read_snapshot_metadata(raw: np.ndarray) -> dict:
+    """Decode the JSON metadata entry of a snapshot."""
+    if raw.ndim != 1 or raw.dtype != np.uint8:
+        raise HNSWSnapshotError("Snapshot metadata entry has an invalid format.")
+    try:
+        metadata = json.loads(raw.tobytes().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HNSWSnapshotError(f"Snapshot metadata is not valid JSON: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise HNSWSnapshotError("Snapshot metadata must be a JSON object.")
+    return metadata
+
+
+def _validate_snapshot_metadata(metadata: dict, distance_func_id: str, max_nodes: Optional[int]):
+    """Validate the metadata of a snapshot. This runs before any array data
+    is loaded so that a snapshot exceeding the node budget is rejected
+    early.
+    """
+    if metadata.get("format") != SNAPSHOT_FORMAT_NAME:
+        raise HNSWSnapshotError(f"Not an HNSW snapshot (format {metadata.get('format')!r}).")
+    version = metadata.get("version")
+    if version != SNAPSHOT_FORMAT_VERSION:
+        raise HNSWSnapshotError(f"Unsupported snapshot format version: {version!r}.")
+    stored_id = metadata.get("distance_func_id")
+    if not isinstance(stored_id, str) or not stored_id:
+        raise HNSWSnapshotError("Snapshot has an invalid distance function identifier.")
+    if distance_func_id != stored_id:
+        raise HNSWSnapshotError(
+            f"Distance function identifier mismatch: the snapshot was saved with "
+            f"{stored_id!r} but {distance_func_id!r} was provided. The distance "
+            f"function must be the same one used to build the saved index."
+        )
+    params = metadata.get("params")
+    if not isinstance(params, dict):
+        raise HNSWSnapshotError("Snapshot is missing the construction parameters.")
+    params = {
+        "m": _snapshot_expect_int(params.get("m"), "params.m", minimum=1),
+        "ef_construction": _snapshot_expect_int(params.get("ef_construction"), "params.ef_construction", minimum=1),
+        "m0": _snapshot_expect_int(params.get("m0"), "params.m0", minimum=1),
+        "reversed_edges": params.get("reversed_edges"),
+    }
+    if not isinstance(params["reversed_edges"], bool):
+        raise HNSWSnapshotError("Snapshot field 'params.reversed_edges' must be a boolean.")
+    count = _snapshot_expect_int(metadata.get("count"), "count", minimum=0)
+    if max_nodes is not None and count > max_nodes:
+        raise HNSWSnapshotError(
+            f"Snapshot contains {count} nodes, which exceeds the budget of {max_nodes}."
+        )
+    dim = _snapshot_expect_int(metadata.get("dim"), "dim", minimum=0, maximum=SNAPSHOT_MAX_DIM)
+    if count == 0 and dim != 0:
+        raise HNSWSnapshotError("Snapshot of an empty index must have dimension 0.")
+    if count > 0 and dim < 1:
+        raise HNSWSnapshotError("Snapshot dimension must be at least 1.")
+    dtype = metadata.get("dtype")
+    if dtype not in _SNAPSHOT_POINT_DTYPES:
+        raise HNSWSnapshotError(f"Unsupported point dtype in snapshot: {dtype!r}.")
+    num_layers = _snapshot_expect_int(metadata.get("num_layers"), "num_layers", minimum=0, maximum=SNAPSHOT_MAX_LAYERS)
+    entry_point = _snapshot_expect_int(metadata.get("entry_point"), "entry_point", minimum=-1)
+    if count == 0:
+        if num_layers != 0 or entry_point != -1:
+            raise HNSWSnapshotError("Snapshot of an empty index must have no layers and no entry point.")
+    else:
+        if num_layers < 1:
+            raise HNSWSnapshotError("Snapshot of a non-empty index must have at least one layer.")
+        if entry_point >= count:
+            raise HNSWSnapshotError(f"Snapshot entry point {entry_point} does not reference an existing node.")
+    encoded_keys = metadata.get("keys")
+    if not isinstance(encoded_keys, list) or len(encoded_keys) != count:
+        raise HNSWSnapshotError("Snapshot key list does not match the node count.")
+    keys = [_decode_snapshot_key(entry) for entry in encoded_keys]
+    if len(set(keys)) != count:
+        raise HNSWSnapshotError("Snapshot contains duplicate keys.")
+    random_state = metadata.get("random_state")
+    if not isinstance(random_state, dict):
+        raise HNSWSnapshotError("Snapshot is missing the random state.")
+    random_state = {
+        "pos": _snapshot_expect_int(random_state.get("pos"), "random_state.pos", minimum=0, maximum=624),
+        "has_gauss": _snapshot_expect_int(
+            random_state.get("has_gauss"), "random_state.has_gauss", minimum=0, maximum=1
+        ),
+        "cached_gaussian": random_state.get("cached_gaussian"),
+    }
+    if (
+        isinstance(random_state["cached_gaussian"], bool)
+        or not isinstance(random_state["cached_gaussian"], (int, float))
+        or not np.isfinite(random_state["cached_gaussian"])
+    ):
+        raise HNSWSnapshotError("Snapshot field 'random_state.cached_gaussian' must be a finite number.")
+    random_state["cached_gaussian"] = float(random_state["cached_gaussian"])
+    return params, count, dim, dtype, entry_point, num_layers, keys, random_state
+
+
+def _validate_snapshot_arrays(arrays: dict, count: int, dim: int, dtype: str, num_layers: int, entry_point: int):
+    """Validate the array entries of a snapshot against the metadata and
+    the structural invariants of the HNSW graph.
+    """
+    expected_names = {"points", "deleted", "random_keys"}
+    for level in range(num_layers):
+        for suffix in ("members", "indptr", "indices", "data"):
+            expected_names.add(f"layer_{level}_{suffix}")
+    missing = expected_names - set(arrays)
+    if missing:
+        raise HNSWSnapshotError(f"Snapshot is missing entries: {sorted(missing)}.")
+    unexpected = set(arrays) - expected_names
+    if unexpected:
+        raise HNSWSnapshotError(f"Snapshot contains unexpected entries: {sorted(unexpected)}.")
+
+    points = arrays["points"]
+    if points.shape != (count, dim) or points.dtype.name != dtype:
+        raise HNSWSnapshotError(
+            f"Snapshot points must have shape ({count}, {dim}) and dtype {dtype!r}, "
+            f"got shape {points.shape} and dtype {points.dtype.name!r}."
+        )
+    if count > 0 and not np.isfinite(points).all():
+        raise HNSWSnapshotError("Snapshot points contain non-finite values.")
+    deleted = arrays["deleted"]
+    if deleted.shape != (count,) or deleted.dtype not in (np.uint8, np.bool_):
+        raise HNSWSnapshotError("Snapshot soft-deletion flags have an invalid shape or dtype.")
+    if count > 0 and not np.isin(deleted, (0, 1)).all():
+        raise HNSWSnapshotError("Snapshot soft-deletion flags must be 0 or 1.")
+    random_keys = arrays["random_keys"]
+    if random_keys.shape != (624,) or random_keys.dtype != np.uint32:
+        raise HNSWSnapshotError("Snapshot random state has an invalid shape or dtype.")
+
+    layers_data = []
+    previous_members = None
+    for level in range(num_layers):
+        members = arrays[f"layer_{level}_members"]
+        indptr = arrays[f"layer_{level}_indptr"]
+        indices = arrays[f"layer_{level}_indices"]
+        data = arrays[f"layer_{level}_data"]
+        if members.shape != (count,) or members.dtype != np.bool_:
+            raise HNSWSnapshotError(f"Snapshot layer {level} has an invalid membership mask.")
+        if indptr.shape != (count + 1,) or indptr.dtype != np.int64:
+            raise HNSWSnapshotError(f"Snapshot layer {level} has an invalid index pointer array.")
+        if indptr[0] != 0 or (indptr[:-1] > indptr[1:]).any():
+            raise HNSWSnapshotError(f"Snapshot layer {level} has a corrupt index pointer array.")
+        if indices.shape != (indptr[-1],) or indices.dtype != np.int64:
+            raise HNSWSnapshotError(f"Snapshot layer {level} has an invalid neighbor index array.")
+        if data.shape != (indptr[-1],) or data.dtype != np.float64:
+            raise HNSWSnapshotError(f"Snapshot layer {level} has an invalid distance array.")
+        if len(indices) > 0:
+            if (indices < 0).any() or (indices >= count).any():
+                raise HNSWSnapshotError(f"Snapshot layer {level} references a nonexistent neighbor.")
+            if not np.isfinite(data).all():
+                raise HNSWSnapshotError(f"Snapshot layer {level} contains non-finite distances.")
+            if not members[indices].all():
+                raise HNSWSnapshotError(
+                    f"Snapshot layer {level} references a neighbor that is not a member of the layer."
+                )
+            owner = np.repeat(np.arange(count), np.diff(indptr))
+            if (indices == owner).any():
+                raise HNSWSnapshotError(f"Snapshot layer {level} contains a self-loop.")
+            if not members[owner].all():
+                raise HNSWSnapshotError(f"Snapshot layer {level} contains edges from a non-member node.")
+        if level == 0:
+            if count > 0 and not members.all():
+                raise HNSWSnapshotError("Snapshot base layer must contain every node.")
+        else:
+            if (members & ~previous_members).any():
+                raise HNSWSnapshotError(f"Snapshot layer {level} is not nested inside layer {level - 1}.")
+        layers_data.append((members, indptr, indices, data))
+        previous_members = members
+    if count > 0 and not layers_data[-1][0][entry_point]:
+        raise HNSWSnapshotError("Snapshot entry point is not a member of the top layer.")
+    return layers_data
 
 
 class _Layer:
@@ -76,7 +312,7 @@ class _LayerWithReversedEdges(_Layer):
         # where j is a neighbor of key and dist is distance.
         self._graph: dict[Hashable, dict[Hashable, float]] = {key: {}}
         # self._reverse_edges[key] contains a set of neighbors of key.
-        self._reverse_edges: dict[Hashable, set] = {}
+        self._reverse_edges: dict[Hashable, set] = {key: set()}
 
     def __setitem__(self, key: Hashable, value: dict[Hashable, float]) -> None:
         old_neighbors = self._graph.get(key, {})
@@ -93,6 +329,7 @@ class _LayerWithReversedEdges(_Layer):
         del self._graph[key]
         for neighbor in old_neighbors:
             self._reverse_edges[neighbor].discard(key)
+        self._reverse_edges.pop(key, None)
 
     def __eq__(self, __value: object) -> bool:
         if not isinstance(__value, _LayerWithReversedEdges):
@@ -1006,3 +1243,255 @@ class HNSW(MutableMapping):
         new_index = self.copy()
         new_index.update(other)
         return new_index
+
+    def save_snapshot(self, file, distance_func_id: str) -> None:
+        """Save the index to a versioned, safe snapshot file. The snapshot
+        contains the point vectors, the adjacency of every graph layer, the
+        construction parameters, the state of the random number generator,
+        and the soft-deletion flags. It does **not** contain any pickled
+        Python objects, so loading a snapshot cannot execute arbitrary code.
+
+        The distance function is not part of the snapshot. Instead, the
+        caller provides an opaque identifier for it, which is stored in the
+        snapshot and must be confirmed by the loading party through
+        :meth:`load_snapshot`.
+
+        Keys are stored with explicit type tags. Format version 1 supports
+        only ``str`` and ``int`` keys; points must be 1-D vectors of
+        ``float32`` or ``float64`` with dimension at most
+        ``SNAPSHOT_MAX_DIM``.
+
+        Args:
+            file: A file path (``str`` or ``os.PathLike``) or a writable
+                binary file-like object. When a path is given, the snapshot
+                is written atomically (a temporary file is renamed over the
+                target), so a pre-existing snapshot is never left
+                half-overwritten.
+            distance_func_id (str): A non-empty identifier of the distance
+                function used by this index (e.g. ``"l2"``). It is recorded
+                in the snapshot and checked by :meth:`load_snapshot`.
+
+        Raises:
+            TypeError: If a key is not a ``str`` or ``int``, or the points
+                have an unsupported dtype.
+            ValueError: If ``distance_func_id`` is empty or the points have
+                an unsupported dimensionality.
+
+        Examples:
+            .. code-block:: python
+
+                from datasketch.hnsw import HNSW
+                import numpy as np
+
+                index = HNSW(distance_func=lambda x, y: np.linalg.norm(x - y), seed=42)
+                index.update({i: v for i, v in enumerate(np.random.rand(100, 10))})
+                index.save_snapshot("index.snapshot", distance_func_id="l2")
+
+        """
+        if not isinstance(distance_func_id, str) or not distance_func_id:
+            raise ValueError("distance_func_id must be a non-empty string.")
+        keys = list(self._nodes.keys())
+        encoded_keys = [_encode_snapshot_key(key) for key in keys]
+        if keys:
+            points = np.stack([np.asarray(self._nodes[key].point) for key in keys])
+            if points.ndim != 2 or not 1 <= points.shape[1] <= SNAPSHOT_MAX_DIM:
+                raise ValueError(
+                    f"Points must be 1-D vectors with dimension between 1 and "
+                    f"{SNAPSHOT_MAX_DIM}, got shape {points.shape}."
+                )
+            if points.dtype.name not in _SNAPSHOT_POINT_DTYPES:
+                raise TypeError(
+                    f"Points must have dtype float32 or float64 to be saved "
+                    f"in a snapshot, got {points.dtype.name!r}."
+                )
+            dim = points.shape[1]
+            dtype = points.dtype.name
+        else:
+            points = np.empty((0, 0), dtype=np.float64)
+            dim = 0
+            dtype = "float64"
+        deleted = np.array([self._nodes[key].is_deleted for key in keys], dtype=np.uint8)
+        # The random state of np.random.RandomState is a tuple
+        # ('MT19937', array of 624 uint32, pos, has_gauss, cached_gaussian).
+        state_name, state_keys, state_pos, state_has_gauss, state_cached_gaussian = self._random.get_state()
+        if state_name != "MT19937":
+            raise ValueError(f"Unsupported random number generator state: {state_name!r}.")
+        metadata = {
+            "format": SNAPSHOT_FORMAT_NAME,
+            "version": SNAPSHOT_FORMAT_VERSION,
+            "distance_func_id": distance_func_id,
+            "params": {
+                "m": self._m,
+                "ef_construction": self._ef_construction,
+                "m0": self._m0,
+                "reversed_edges": self._layer_class is _LayerWithReversedEdges,
+            },
+            "count": len(keys),
+            "dim": dim,
+            "dtype": dtype,
+            "entry_point": -1 if self._entry_point is None else keys.index(self._entry_point),
+            "num_layers": len(self._graphs),
+            "keys": encoded_keys,
+            "random_state": {
+                "pos": int(state_pos),
+                "has_gauss": int(state_has_gauss),
+                "cached_gaussian": float(state_cached_gaussian),
+            },
+        }
+        arrays = {
+            "metadata": np.frombuffer(json.dumps(metadata).encode("utf-8"), dtype=np.uint8),
+            "points": points,
+            "deleted": deleted,
+            "random_keys": np.asarray(state_keys, dtype=np.uint32),
+        }
+        key_to_index = {key: i for i, key in enumerate(keys)}
+        # Each layer is stored in CSR-like form: a membership mask plus,
+        # for every node, a contiguous slice of neighbor indices and
+        # distances delimited by an index pointer array.
+        for level, layer in enumerate(self._graphs):
+            members = np.zeros(len(keys), dtype=np.bool_)
+            indptr = np.zeros(len(keys) + 1, dtype=np.int64)
+            indices = []
+            distances = []
+            for i, key in enumerate(keys):
+                if key in layer:
+                    members[i] = True
+                    for neighbor, dist in layer[key].items():
+                        indices.append(key_to_index[neighbor])
+                        distances.append(dist)
+                indptr[i + 1] = len(indices)
+            arrays[f"layer_{level}_members"] = members
+            arrays[f"layer_{level}_indptr"] = indptr
+            arrays[f"layer_{level}_indices"] = np.asarray(indices, dtype=np.int64)
+            arrays[f"layer_{level}_data"] = np.asarray(distances, dtype=np.float64)
+        if isinstance(file, (str, os.PathLike)):
+            path = os.fspath(file)
+            fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as tmp_file:
+                    np.savez(tmp_file, **arrays)
+                os.replace(tmp_path, path)
+            except BaseException:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                raise
+        else:
+            np.savez(file, **arrays)
+
+    @classmethod
+    def load_snapshot(
+        cls,
+        file,
+        distance_func: Callable[[np.ndarray, np.ndarray], float],
+        distance_func_id: str,
+        max_nodes: Optional[int] = None,
+    ) -> HNSW:
+        """Load an index from a snapshot file created by :meth:`save_snapshot`.
+
+        The distance function is never read from the snapshot; it must be
+        supplied again by the caller, and its identifier must match the one
+        recorded in the snapshot. The snapshot is fully validated *before*
+        the new index is constructed: the node count is checked against the
+        ``max_nodes`` budget, keys must be unique ``str`` or ``int`` values,
+        every neighbor reference must point to an existing node that is a
+        member of the same layer, layer memberships must be properly nested,
+        and the entry point must be a valid member of the top layer. If any
+        check fails, an :class:`HNSWSnapshotError` is raised and no index is
+        created, so a bad snapshot can never overwrite or corrupt an
+        existing index.
+
+        Args:
+            file: A file path (``str`` or ``os.PathLike``) or a readable
+                binary file-like object containing the snapshot.
+            distance_func: The distance function of the original index.
+            distance_func_id (str): The identifier of the distance function.
+                Must match the identifier stored in the snapshot.
+            max_nodes (Optional[int]): The maximum number of nodes allowed
+                in the snapshot. If the snapshot contains more nodes, it is
+                rejected before any array data is loaded. If None, no budget
+                is enforced.
+
+        Returns:
+            HNSW: A new index with the same points, graph structure,
+            construction parameters, random state, and soft-deletion flags
+            as the saved index.
+
+        Raises:
+            HNSWSnapshotError: If the snapshot is corrupt, has an
+                unsupported format or version, fails any validation check,
+                or the distance function identifier does not match.
+
+        Examples:
+            .. code-block:: python
+
+                from datasketch.hnsw import HNSW
+                import numpy as np
+
+                index = HNSW.load_snapshot(
+                    "index.snapshot",
+                    distance_func=lambda x, y: np.linalg.norm(x - y),
+                    distance_func_id="l2",
+                    max_nodes=1_000_000,
+                )
+
+        """
+        try:
+            with np.load(file, allow_pickle=False) as archive:
+                names = set(archive.files)
+                if "metadata" not in names:
+                    raise HNSWSnapshotError("Snapshot is missing the metadata entry.")
+                metadata = _read_snapshot_metadata(archive["metadata"])
+                (
+                    params,
+                    count,
+                    dim,
+                    dtype,
+                    entry_point,
+                    num_layers,
+                    keys,
+                    random_state,
+                ) = _validate_snapshot_metadata(metadata, distance_func_id, max_nodes)
+                arrays = {name: archive[name] for name in names if name != "metadata"}
+        except HNSWSnapshotError:
+            raise
+        except Exception as exc:
+            raise HNSWSnapshotError(f"Cannot read snapshot: {exc}") from exc
+        layers_data = _validate_snapshot_arrays(arrays, count, dim, dtype, num_layers, entry_point)
+        # All validation is done. Only now build the new index, so a bad
+        # snapshot can never leave behind a partially loaded object.
+        index = cls(
+            distance_func=distance_func,
+            m=params["m"],
+            ef_construction=params["ef_construction"],
+            m0=params["m0"],
+            reversed_edges=params["reversed_edges"],
+        )
+        points = arrays["points"]
+        deleted = arrays["deleted"]
+        index._nodes = OrderedDict(
+            (key, _Node(key, points[i], bool(deleted[i]))) for i, key in enumerate(keys)
+        )
+        graphs = []
+        for level in range(num_layers):
+            members, indptr, indices, data = layers_data[level]
+            layer = index._layer_class(None)
+            del layer[None]
+            for i, key in enumerate(keys):
+                if members[i]:
+                    start, end = indptr[i], indptr[i + 1]
+                    layer[key] = {
+                        keys[j]: float(d) for j, d in zip(indices[start:end], data[start:end])
+                    }
+            graphs.append(layer)
+        index._graphs = graphs
+        index._entry_point = None if entry_point < 0 else keys[entry_point]
+        index._random.set_state(
+            (
+                "MT19937",
+                np.asarray(arrays["random_keys"], dtype=np.uint32),
+                random_state["pos"],
+                random_state["has_gauss"],
+                random_state["cached_gaussian"],
+            )
+        )
+        return index

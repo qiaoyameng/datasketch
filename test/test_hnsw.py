@@ -1,10 +1,14 @@
+import io
+import json
+import os
+import tempfile
 import unittest
 import warnings
 
 import numpy as np
 import pytest
 
-from datasketch.hnsw import HNSW
+from datasketch.hnsw import HNSW, HNSWSnapshotError
 from datasketch.minhash import MinHash
 
 
@@ -300,3 +304,248 @@ class TestHNSWMinHashJaccard(TestHNSW):
 
     def _search_index(self, index, queries, k=10):
         return super()._search_index_dist(index, queries, minhash_jaccard_distance, k)
+
+
+class TestHNSWSnapshot(unittest.TestCase):
+    def _create_index(self, n=200, dim=16, seed=42, index_seed=12345, **kwargs):
+        data = np.random.RandomState(seed).rand(n, dim)
+        index = HNSW(
+            distance_func=l2_distance,
+            m=16,
+            ef_construction=100,
+            seed=index_seed,
+            **kwargs,
+        )
+        for i, point in enumerate(data):
+            index.insert(i, point)
+        return index, data
+
+    def _save_to_bytes(self, index, distance_func_id="l2"):
+        buf = io.BytesIO()
+        index.save_snapshot(buf, distance_func_id)
+        return buf.getvalue()
+
+    def _load_from_bytes(self, data, distance_func_id="l2", **kwargs):
+        return HNSW.load_snapshot(
+            io.BytesIO(data),
+            distance_func=l2_distance,
+            distance_func_id=distance_func_id,
+            **kwargs,
+        )
+
+    def _read_snapshot_arrays(self, data):
+        with np.load(io.BytesIO(data), allow_pickle=False) as archive:
+            return {name: archive[name] for name in archive.files}
+
+    def _write_snapshot_arrays(self, arrays):
+        buf = io.BytesIO()
+        np.savez(buf, **arrays)
+        return buf.getvalue()
+
+    def _edit_snapshot(self, data, array_edits=None, metadata_edit=None):
+        arrays = self._read_snapshot_arrays(data)
+        if array_edits:
+            arrays.update(array_edits)
+        if metadata_edit is not None:
+            metadata = json.loads(arrays["metadata"].tobytes().decode("utf-8"))
+            metadata_edit(metadata)
+            arrays["metadata"] = np.frombuffer(json.dumps(metadata).encode("utf-8"), dtype=np.uint8)
+        return self._write_snapshot_arrays(arrays)
+
+    def test_roundtrip_fixed_seed(self):
+        index, data = self._create_index()
+        self.assertGreaterEqual(len(index._graphs), 2)
+        # Soft-remove some points to exercise the soft-deletion flags.
+        index.remove(3)
+        index.remove(17)
+        loaded = self._load_from_bytes(self._save_to_bytes(index))
+        self.assertEqual(index, loaded)
+        # Queries return identical results.
+        for query in data[:20]:
+            self.assertEqual(index.query(query, 10), loaded.query(query, 10))
+        # Subsequent inserts evolve both indexes identically because the
+        # random state is restored.
+        new_data = np.random.RandomState(7).rand(50, data.shape[1])
+        for j, point in enumerate(new_data):
+            index.insert(1000 + j, point)
+            loaded.insert(1000 + j, point)
+        self.assertEqual(index, loaded)
+        for query in new_data[:10]:
+            self.assertEqual(index.query(query, 10), loaded.query(query, 10))
+
+    def test_roundtrip_str_keys(self):
+        index, data = self._create_index(n=100, dim=8)
+        str_index = HNSW(distance_func=l2_distance, m=16, ef_construction=100, seed=12345)
+        for i, point in enumerate(data):
+            str_index.insert(f"key-{i}", point)
+        loaded = self._load_from_bytes(self._save_to_bytes(str_index))
+        self.assertEqual(str_index, loaded)
+        self.assertEqual(str_index.query(data[0], 5), loaded.query(data[0], 5))
+
+    def test_roundtrip_reversed_edges(self):
+        index, data = self._create_index(n=100, dim=8, reversed_edges=True)
+        index.remove(5, hard=True)
+        index.remove(6)
+        loaded = self._load_from_bytes(self._save_to_bytes(index))
+        self.assertEqual(index, loaded)
+
+    def test_roundtrip_empty_index(self):
+        index = HNSW(distance_func=l2_distance, seed=1)
+        loaded = self._load_from_bytes(self._save_to_bytes(index))
+        self.assertEqual(index, loaded)
+        self.assertEqual(len(loaded), 0)
+
+    def test_roundtrip_file_path(self):
+        index, data = self._create_index(n=100, dim=8)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "index.snapshot")
+            index.save_snapshot(path, distance_func_id="l2")
+            loaded = HNSW.load_snapshot(path, distance_func=l2_distance, distance_func_id="l2")
+        self.assertEqual(index, loaded)
+
+    def test_distance_func_id_mismatch(self):
+        index, _ = self._create_index(n=50, dim=8)
+        snapshot = self._save_to_bytes(index)
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(snapshot, distance_func_id="cosine")
+
+    def test_max_nodes_budget(self):
+        index, _ = self._create_index(n=100, dim=8)
+        snapshot = self._save_to_bytes(index)
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(snapshot, max_nodes=99)
+        loaded = self._load_from_bytes(snapshot, max_nodes=100)
+        self.assertEqual(index, loaded)
+
+    def test_duplicate_keys_rejected(self):
+        index, _ = self._create_index(n=50, dim=8)
+        snapshot = self._save_to_bytes(index)
+
+        def duplicate_first_key(metadata):
+            metadata["keys"][1] = metadata["keys"][0]
+
+        tampered = self._edit_snapshot(snapshot, metadata_edit=duplicate_first_key)
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(tampered)
+
+    def test_tampered_neighbor_out_of_range(self):
+        index, _ = self._create_index(n=100, dim=8)
+        snapshot = self._save_to_bytes(index)
+        arrays = self._read_snapshot_arrays(snapshot)
+        indices = arrays["layer_0_indices"].copy()
+        indices[0] = 100  # Nonexistent node.
+        tampered = self._edit_snapshot(snapshot, array_edits={"layer_0_indices": indices})
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(tampered)
+
+    def test_tampered_cross_layer_reference(self):
+        index, _ = self._create_index(n=200, dim=16)
+        self.assertGreaterEqual(len(index._graphs), 2)
+        snapshot = self._save_to_bytes(index)
+        arrays = self._read_snapshot_arrays(snapshot)
+        members = arrays["layer_1_members"]
+        non_member = int(np.flatnonzero(~members)[0])
+        indices = arrays["layer_1_indices"].copy()
+        # Point an existing edge of layer 1 at a node that is not a member
+        # of layer 1.
+        indices[0] = non_member
+        tampered = self._edit_snapshot(snapshot, array_edits={"layer_1_indices": indices})
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(tampered)
+
+    def test_tampered_entry_point(self):
+        index, _ = self._create_index(n=100, dim=8)
+        snapshot = self._save_to_bytes(index)
+        # Entry point out of range.
+        tampered = self._edit_snapshot(snapshot, metadata_edit=lambda m: m.update(entry_point=100))
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(tampered)
+        # Entry point that is not a member of the top layer.
+        arrays = self._read_snapshot_arrays(snapshot)
+        top_members = arrays[f"layer_{len(index._graphs) - 1}_members"]
+        non_member = int(np.flatnonzero(~top_members)[0])
+        tampered = self._edit_snapshot(snapshot, metadata_edit=lambda m: m.update(entry_point=non_member))
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(tampered)
+
+    def test_tampered_points_shape(self):
+        index, data = self._create_index(n=100, dim=8)
+        snapshot = self._save_to_bytes(index)
+        arrays = self._read_snapshot_arrays(snapshot)
+        bad_points = np.zeros((100, 7), dtype=np.float64)
+        tampered = self._edit_snapshot(snapshot, array_edits={"points": bad_points})
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(tampered)
+        bad_dtype = arrays["points"].astype(np.float32)
+        tampered = self._edit_snapshot(snapshot, array_edits={"points": bad_dtype})
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(tampered)
+
+    def test_tampered_deleted_shape(self):
+        index, _ = self._create_index(n=100, dim=8)
+        snapshot = self._save_to_bytes(index)
+        bad_deleted = np.zeros(101, dtype=np.uint8)
+        tampered = self._edit_snapshot(snapshot, array_edits={"deleted": bad_deleted})
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(tampered)
+
+    def test_tampered_layer_structure(self):
+        index, _ = self._create_index(n=100, dim=8)
+        snapshot = self._save_to_bytes(index)
+        arrays = self._read_snapshot_arrays(snapshot)
+        # Non-monotonic index pointer array.
+        indptr = arrays["layer_0_indptr"].copy()
+        indptr[1] = indptr[2] + 1
+        tampered = self._edit_snapshot(snapshot, array_edits={"layer_0_indptr": indptr})
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(tampered)
+        # Base layer no longer contains every node.
+        members = arrays["layer_0_members"].copy()
+        members[0] = False
+        tampered = self._edit_snapshot(snapshot, array_edits={"layer_0_members": members})
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(tampered)
+
+    def test_unsupported_version_rejected(self):
+        index, _ = self._create_index(n=50, dim=8)
+        snapshot = self._save_to_bytes(index)
+        tampered = self._edit_snapshot(snapshot, metadata_edit=lambda m: m.update(version=2))
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(tampered)
+
+    def test_corrupt_file_rejected(self):
+        index, _ = self._create_index(n=50, dim=8)
+        snapshot = self._save_to_bytes(index)
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(snapshot[: len(snapshot) // 2])
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(b"not a snapshot at all")
+
+    def test_bad_snapshot_does_not_publish(self):
+        index, data = self._create_index(n=100, dim=8)
+        snapshot = self._save_to_bytes(index)
+        existing, _ = self._create_index(n=50, dim=8, seed=1, index_seed=2)
+        existing_before = existing.copy()
+        arrays = self._read_snapshot_arrays(snapshot)
+        indices = arrays["layer_0_indices"].copy()
+        indices[0] = 100
+        tampered = self._edit_snapshot(snapshot, array_edits={"layer_0_indices": indices})
+        with self.assertRaises(HNSWSnapshotError):
+            self._load_from_bytes(tampered)
+        # The existing index is untouched and no half-loaded object exists.
+        self.assertEqual(existing, existing_before)
+        # A subsequent valid load still works.
+        loaded = self._load_from_bytes(snapshot)
+        self.assertEqual(index, loaded)
+
+    def test_unsupported_key_type_save(self):
+        index = HNSW(distance_func=l2_distance, seed=1)
+        index.insert(("a", 1), np.random.rand(8))
+        with self.assertRaises(TypeError):
+            self._save_to_bytes(index)
+
+    def test_unsupported_point_dtype_save(self):
+        index = HNSW(distance_func=l2_distance, seed=1)
+        index.insert(0, np.arange(8))
+        with self.assertRaises(TypeError):
+            self._save_to_bytes(index)
