@@ -35,6 +35,10 @@ Weighted MinHash
     :members:
     :special-members:
 
+.. autoclass:: datasketch.UpdatableWeightedMinHash
+    :members:
+    :special-members:
+
 MinHash LSH
 -----------
 

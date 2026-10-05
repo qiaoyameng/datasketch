@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections.abc
 import copy
+import operator
 from typing import Union
 
 import numpy as np
@@ -119,6 +120,19 @@ class WeightedMinHashGenerator:
         self.rs = generator.gamma(2, 1, (sample_size, dim)).astype(np.float32)
         self.ln_cs = np.log(generator.gamma(2, 1, (sample_size, dim))).astype(np.float32)
         self.betas = generator.uniform(0, 1, (sample_size, dim)).astype(np.float32)
+
+    def updatable_minhash(self, v: Union[np.ndarray, None] = None) -> UpdatableWeightedMinHash:
+        """Create an updatable weighted MinHash summary.
+
+        Args:
+            v (Union[numpy.ndarray, None]): The initial nonnegative Jaccard
+                vector, or ``None`` to start with an all-zero vector.
+
+        Returns:
+            UpdatableWeightedMinHash: The updatable summary.
+
+        """
+        return UpdatableWeightedMinHash.from_generator(self, v)
 
     def minhash(self, v: np.ndarray) -> WeightedMinHash:
         """Create a new weighted MinHash given a weighted Jaccard vector.
@@ -245,3 +259,293 @@ class WeightedMinHashGenerator:
                 ret[it_doc] = WeightedMinHash(self.seed, hashvalues)
 
         return ret
+
+
+class UpdatableWeightedMinHash:
+    """A weighted MinHash summary supporting one-dimensional weight updates.
+
+    Unlike :class:`WeightedMinHash`, this object keeps the intermediate
+    candidate values needed to replace a sample's winner when that winner's
+    weight changes or becomes zero. For each sample it stores ``t`` and
+    ``ln_a`` arrays with shape ``(sample_size, dim)``; inactive dimensions
+    contain ``numpy.nan``.
+
+    The candidate state therefore uses ``O(sample_size * dim)`` memory,
+    approximately 8 bytes for each sample/dimension pair for the float32
+    candidate arrays, in addition to the generator's three random-parameter
+    matrices and the exported ``(sample_size, 2)`` hash values. It is not a
+    fixed-size digest.
+
+    Use :meth:`WeightedMinHashGenerator.updatable_minhash` to create an
+    instance with the same random parameters as an existing generator.
+
+    Args:
+        dim (int): The number of dimensions of the input Jaccard vectors.
+        sample_size (int): The number of samples to use for creating weighted
+            MinHash.
+        seed (int): The random seed to use for generating permutation
+            functions.
+        v (Union[numpy.ndarray, None]): The initial nonnegative Jaccard
+            vector, or ``None`` to start empty.
+
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        sample_size: int = 128,
+        seed: int = 1,
+        v: Union[np.ndarray, None] = None,
+    ) -> None:
+        generator = WeightedMinHashGenerator(dim, sample_size, seed)
+        self._set_generator(generator)
+        self._initialize_state(v)
+
+    @classmethod
+    def from_generator(
+        cls,
+        generator: WeightedMinHashGenerator,
+        v: Union[np.ndarray, None] = None,
+    ) -> UpdatableWeightedMinHash:
+        """Create a summary that reuses a generator's random parameters."""
+        if not isinstance(generator, WeightedMinHashGenerator):
+            raise TypeError("generator must be a WeightedMinHashGenerator")
+        summary = cls.__new__(cls)
+        summary._set_generator(generator)
+        summary._initialize_state(v)
+        return summary
+
+    @property
+    def seed(self) -> int:
+        """The random seed used by the weighted MinHash generator."""
+        return self._generator.seed
+
+    @property
+    def dim(self) -> int:
+        """The number of input dimensions."""
+        return self._generator.dim
+
+    @property
+    def sample_size(self) -> int:
+        """The number of weighted MinHash samples."""
+        return self._generator.sample_size
+
+    @property
+    def empty(self) -> bool:
+        """Whether every dimension currently has weight zero."""
+        return self._nonzero_count == 0
+
+    @property
+    def candidate_memory_bytes(self) -> int:
+        """The number of bytes used by the two retained candidate matrices."""
+        return self._t.nbytes + self._ln_a.nbytes
+
+    @property
+    def weights(self) -> np.ndarray:
+        """A copy of the current weight vector."""
+        return self._weights.copy()
+
+    def update(self, index: int, weight: float) -> UpdatableWeightedMinHash:
+        """Set one dimension to a nonnegative finite weight.
+
+        This supports increasing a weight, decreasing it, and setting it to
+        zero. Invalid input is rejected before any candidate or hash value is
+        changed.
+
+        Args:
+            index (int): The dimension to update.
+            weight (float): The new finite, nonnegative weight.
+
+        Returns:
+            UpdatableWeightedMinHash: This summary, to allow chaining.
+
+        Raises:
+            IndexError: If ``index`` is outside ``[0, dim)``.
+            TypeError: If ``index`` is not an integer.
+            ValueError: If ``weight`` is negative, NaN, infinite, or
+                non-scalar.
+
+        """
+        dimension = operator.index(index)
+        if not 0 <= dimension < self.dim:
+            raise IndexError("Dimension index %d is outside [0, %d)" % (dimension, self.dim))
+        new_weight = self._coerce_weight(weight)
+        old_weight = self._weights[dimension]
+        if new_weight == old_weight:
+            return self
+
+        rs = self._generator.rs[:, dimension]
+        ln_cs = self._generator.ln_cs[:, dimension]
+        betas = self._generator.betas[:, dimension]
+
+        if new_weight > 0:
+            new_t = np.floor(np.log(new_weight) / rs + betas)
+            new_ln_a = ln_cs - (new_t - betas) * rs - rs
+        else:
+            new_t = np.full(self.sample_size, np.nan, dtype=np.float32)
+            new_ln_a = np.full(self.sample_size, np.nan, dtype=np.float32)
+
+        new_hashvalues = self.hashvalues.copy()
+        if self.empty:
+            if new_weight > 0:
+                new_hashvalues[:, 0] = dimension
+                new_hashvalues[:, 1] = new_t.astype(new_hashvalues.dtype)
+            else:
+                new_hashvalues.fill(0)
+        else:
+            old_winners = self.hashvalues[:, 0]
+            sample_indices = np.arange(self.sample_size)
+            replacement_k = old_winners.copy()
+            replacement_t = self._t[sample_indices, old_winners].copy()
+            replacement_score = self._ln_a[sample_indices, old_winners].copy()
+
+            winner_rows = old_winners == dimension
+            winner_indices = np.flatnonzero(winner_rows)
+            if winner_indices.size > 0:
+                other_scores = self._ln_a[winner_indices, :].copy()
+                other_scores[:, dimension] = np.nan
+                has_other = ~np.isnan(other_scores).all(axis=1)
+
+                replacement_score[winner_indices] = np.nan
+                replacement_t[winner_indices] = np.nan
+
+                valid_positions = np.flatnonzero(has_other)
+                if valid_positions.size > 0:
+                    valid_winner_rows = winner_indices[valid_positions]
+                    other_k = np.nanargmin(other_scores[valid_positions], axis=1)
+                    replacement_k[valid_winner_rows] = other_k
+                    replacement_score[valid_winner_rows] = self._ln_a[valid_winner_rows, other_k]
+                    replacement_t[valid_winner_rows] = self._t[valid_winner_rows, other_k]
+
+            valid = ~np.isnan(replacement_score)
+            if new_weight == 0:
+                if not valid.all():
+                    if valid.any():
+                        raise RuntimeError("UpdatableWeightedMinHash candidate state is inconsistent")
+                    new_hashvalues.fill(0)
+                else:
+                    new_hashvalues[:, 0] = replacement_k
+                    new_hashvalues[:, 1] = replacement_t.astype(new_hashvalues.dtype)
+            else:
+                choose_dimension = np.zeros(self.sample_size, dtype=bool)
+                choose_dimension[~valid] = True
+                valid_rows = np.flatnonzero(valid)
+                choose_dimension[valid_rows] = (new_ln_a[valid_rows] < replacement_score[valid_rows]) | (
+                    np.equal(new_ln_a[valid_rows], replacement_score[valid_rows])
+                    & (dimension < replacement_k[valid_rows])
+                )
+                other_rows = ~choose_dimension
+                new_hashvalues[choose_dimension, 0] = dimension
+                new_hashvalues[choose_dimension, 1] = new_t[choose_dimension].astype(new_hashvalues.dtype)
+                new_hashvalues[other_rows, 0] = replacement_k[other_rows]
+                new_hashvalues[other_rows, 1] = replacement_t[other_rows].astype(new_hashvalues.dtype)
+
+        self._t[:, dimension] = new_t
+        self._ln_a[:, dimension] = new_ln_a
+        self._weights[dimension] = new_weight
+        self.hashvalues = new_hashvalues
+        self._nonzero_count = int(np.count_nonzero(self._weights))
+        return self
+
+    set_weight = update
+
+    def minhash(self) -> Union[WeightedMinHash, None]:
+        """Return the current weighted MinHash, or ``None`` when empty.
+
+        This method does not recompute candidate values; it exports the
+        maintained hash values.
+
+        """
+        if self.empty:
+            return None
+        return WeightedMinHash(self.seed, self.digest())
+
+    def digest(self) -> Union[np.ndarray, None]:
+        """Export the current hash values, or ``None`` when the summary is empty."""
+        if self.empty:
+            return None
+        return copy.copy(self.hashvalues)
+
+    def copy(self) -> UpdatableWeightedMinHash:
+        """Return a copy of this updatable summary."""
+        cloned = self.__class__.__new__(self.__class__)
+        cloned._generator = self._generator
+        cloned._weights = self._weights.copy()
+        cloned._t = self._t.copy()
+        cloned._ln_a = self._ln_a.copy()
+        cloned.hashvalues = self.hashvalues.copy()
+        cloned._nonzero_count = self._nonzero_count
+        return cloned
+
+    def __len__(self) -> int:
+        return self.sample_size
+
+    def __eq__(self, other) -> bool:
+        return (
+            type(self) is type(other)
+            and self.seed == other.seed
+            and self.dim == other.dim
+            and np.array_equal(self._weights, other._weights)
+            and np.array_equal(self._t, other._t, equal_nan=True)
+            and np.array_equal(self._ln_a, other._ln_a, equal_nan=True)
+            and np.array_equal(self.hashvalues, other.hashvalues)
+        )
+
+    def _set_generator(self, generator: WeightedMinHashGenerator) -> None:
+        self._generator = generator
+
+    def _initialize_state(self, v: Union[np.ndarray, None]) -> None:
+        weights = self._coerce_vector(v, self.dim)
+        self._weights = weights
+        self.hashvalues = np.zeros((self.sample_size, 2), dtype=int)
+        self._nonzero_count = int(np.count_nonzero(weights))
+
+        if self._nonzero_count == 0:
+            self._t = np.full((self.sample_size, self.dim), np.nan, dtype=np.float32)
+            self._ln_a = np.full((self.sample_size, self.dim), np.nan, dtype=np.float32)
+            return
+
+        active = weights > 0
+        vlog = np.full(self.dim, np.nan, dtype=np.float32)
+        np.log(weights, out=vlog, where=active)
+        self._t = np.floor(vlog[None, :] / self._generator.rs + self._generator.betas)
+        self._ln_a = (
+            self._generator.ln_cs - (self._t - self._generator.betas) * self._generator.rs - self._generator.rs
+        )
+        winners = np.nanargmin(self._ln_a, axis=1)
+        self.hashvalues[:, 0] = winners
+        self.hashvalues[:, 1] = self._t[np.arange(self.sample_size), winners].astype(self.hashvalues.dtype)
+
+    @staticmethod
+    def _coerce_vector(v: Union[np.ndarray, None], dim: int) -> np.ndarray:
+        if v is None:
+            return np.zeros(dim, dtype=np.float32)
+        if not isinstance(v, collections.abc.Sized):
+            raise TypeError("Input vector must be sized")
+        if len(v) != dim:
+            raise ValueError("Input dimension mismatch, expecting %d" % dim)
+        weights = np.array(v, dtype=np.float32)
+        if weights.ndim != 1:
+            raise ValueError("Input vector must have one dimension")
+        if not np.isfinite(weights).all():
+            raise ValueError("Input weights must be finite")
+        if np.any(weights < 0):
+            raise ValueError("Input weights must be nonnegative")
+        return weights
+
+    @staticmethod
+    def _coerce_weight(weight: float) -> np.ndarray:
+        try:
+            value = np.array(weight, dtype=np.float32)
+        except (TypeError, ValueError) as error:
+            raise TypeError("Weight must be a numeric scalar") from error
+        if value.ndim != 0:
+            raise ValueError("Weight must be a scalar")
+        if not np.isfinite(value):
+            raise ValueError("Weight must be finite")
+        if value < 0:
+            raise ValueError("Weight must be nonnegative")
+        return value
+
+
+WeightedMinHashUpdater = UpdatableWeightedMinHash
