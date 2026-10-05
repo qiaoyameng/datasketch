@@ -99,6 +99,42 @@ Just like MinHash LSH, LSH Ensemble also works directly with :ref:`minhash` data
         for key in lshensemble.query(m1, len(set1)):
             print(key)
 
+Incremental Updates
+-------------------
+
+After the initial bulk indexing with
+:meth:`datasketch.MinHashLSHEnsemble.index`, the index can be maintained
+incrementally through an explicit update session created by
+:meth:`datasketch.MinHashLSHEnsemble.update_session`. A session stages
+insertions of new sets, removals of existing sets, and replacements of a
+key's MinHash and size; staged changes are invisible to queries until the
+session is committed. The session commits when the ``with`` block exits
+without an exception (or when ``commit`` is called explicitly); exiting
+with an exception or calling ``cancel`` discards all staged changes and
+leaves the original index fully queryable.
+
+.. code:: python
+
+        with lshensemble.update_session(strategy="rebuild") as session:
+            session.insert("m1", m1, len(set1))          # add a new set
+            session.update("m2", m2_new, len(set2_new))  # replace MinHash and size
+            session.remove("m3")                         # delete a set
+
+Multiple operations on the same key within one session are folded in
+session order, so only the last operation per key takes effect. Every
+staged MinHash is validated against the index: the number of permutations
+must match and MinHashes produced by different permutation schemes cannot
+be mixed into one index; sizes must be positive.
+
+Committing applies all staged changes atomically: the partition indexes
+are rebuilt from the merged collection and swapped in all at once, so a
+failed commit never leaves a key removed from its old partition without
+being added to its new one. The ``strategy`` argument controls
+repartitioning at commit time: ``"rebuild"`` (default) recomputes the
+optimal partitions from the updated size distribution, while ``"keep"``
+reuses the current partition boundaries. Update sessions require the
+in-memory (``dict``) storage backend.
+
 Benchmarks
 ----------
 
@@ -169,4 +205,3 @@ Common Issues with LSH Ensemble
 
 1. `Can I get containment values from LSH Ensemble? <https://github.com/ekzhu/datasketch/issues/97>`__
 2. `How to use LSH Ensemble to find containment-based duplicates? <https://github.com/ekzhu/datasketch/issues/76#issuecomment-521275633>`__
-
