@@ -99,6 +99,35 @@ Just like MinHash LSH, LSH Ensemble also works directly with :ref:`minhash` data
         for key in lshensemble.query(m1, len(set1)):
             print(key)
 
+Incremental updates
+-------------------
+
+In-memory indexes support an explicit transactional update session. Pending
+changes are hidden from queries until ``commit``; committing rebuilds the size
+partitions from the complete resulting dataset. Leaving the context without
+committing cancels the session.
+
+.. code:: python
+
+        replacement = MinHash(num_perm=128)
+        for d in set2 | {"horse", "duck"}:
+            replacement.update(d.encode("utf8"))
+
+        added = MinHash(num_perm=128)
+        for d in {"fish", "bird"}:
+            added.update(d.encode("utf8"))
+
+        with lshensemble.update_session() as session:
+            session.replace("m2", replacement, len(set2) + 2)
+            session.insert("m4", added, 2)
+            session.remove("m3")
+            session.commit()
+
+All MinHashes in one committed dataset must use the same digest parameters
+(number of permutations, seed, and permutation scheme). Removing every old
+entry in a session may switch the remaining dataset to a different family;
+mixing families in one dataset raises ``ValueError``.
+
 Benchmarks
 ----------
 
@@ -169,4 +198,3 @@ Common Issues with LSH Ensemble
 
 1. `Can I get containment values from LSH Ensemble? <https://github.com/ekzhu/datasketch/issues/97>`__
 2. `How to use LSH Ensemble to find containment-based duplicates? <https://github.com/ekzhu/datasketch/issues/76#issuecomment-521275633>`__
-

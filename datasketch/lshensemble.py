@@ -1,7 +1,8 @@
 import logging
 import struct
-from collections import Counter, deque
+from collections import Counter
 from collections.abc import Generator, Hashable, Iterable
+from numbers import Integral
 from typing import Optional
 
 import numpy as np
@@ -12,6 +13,8 @@ from datasketch.minhash import MinHash
 from datasketch.storage import _random_name
 
 logger = logging.getLogger(__name__)
+
+MinHashDigest = tuple[str, Optional[str], int]
 
 
 def _false_positive_probability(threshold, b, r, xq):
@@ -56,6 +59,44 @@ def _optimal_param(threshold, num_perm, max_r, xq, false_positive_weight, false_
                 min_error = error
                 opt = (b, r)
     return opt
+
+
+def _validate_size(size: int) -> int:
+    if isinstance(size, bool) or not isinstance(size, Integral):
+        raise TypeError("Set size must be an integer")
+    size = int(size)
+    if size <= 0:
+        raise ValueError("Set size must be positive")
+    return size
+
+
+def _minhash_digest(minhash: MinHash, num_perm: int) -> MinHashDigest:
+    try:
+        length = len(minhash)
+        seed = getattr(minhash, "seed", None)
+    except (TypeError, AttributeError) as error:
+        raise TypeError("minhash must be a MinHash or WeightedMinHash object") from error
+    if length != num_perm:
+        raise ValueError("Expecting minhash with length %d, got %d" % (num_perm, length))
+    if not isinstance(seed, Integral) or isinstance(seed, bool):
+        raise TypeError("MinHash seed must be an integer")
+    scheme = getattr(minhash, "scheme", None)
+    kind = "minhash" if scheme is not None else "weighted"
+    return kind, scheme, int(seed)
+
+
+def _check_minhash_digest(
+    minhash: MinHash,
+    num_perm: int,
+    known_digest: Optional[MinHashDigest] = None,
+) -> MinHashDigest:
+    digest = _minhash_digest(minhash, num_perm)
+    if known_digest is not None and digest != known_digest:
+        raise ValueError(
+            "MinHash digest parameters %r do not match parameters %r of the indexed MinHashes"
+            % (digest, known_digest)
+        )
+    return digest
 
 
 class MinHashLSHEnsemble:
@@ -130,27 +171,20 @@ class MinHashLSHEnsemble:
         self.threshold = threshold
         self.h = num_perm
         self.m = m
+        self.num_part = num_part
         rs = self._init_optimal_params(weights)
+        self._rs = rs
         # Initialize multiple LSH indexes for each partition
         storage_config = storage_config if storage_config else {"type": "dict"}
-        basename = storage_config.get("basename", _random_name(11))
-        self.indexes = [
-            dict(
-                (
-                    r,
-                    MinHashLSH(
-                        num_perm=self.h,
-                        params=(int(self.h / r), r),
-                        storage_config=self._get_storage_config(basename, storage_config, partition, r),
-                        prepickle=prepickle,
-                    ),
-                )
-                for r in rs
-            )
-            for partition in range(0, num_part)
-        ]
+        self._storage_config = dict(storage_config)
+        self._prepickle = prepickle
+        self._basename = storage_config.get("basename", _random_name(11))
+        self.indexes = self._create_indexes(self._basename)
         self.lowers = [None for _ in self.indexes]
         self.uppers = [None for _ in self.indexes]
+        self._entries: dict[Hashable, tuple[MinHash, int]] = {}
+        self._minhash_digest: Optional[MinHashDigest] = None
+        self._index_initialized = False
 
     def _init_optimal_params(self, weights):
         false_positive_weight, false_negative_weight = weights
@@ -186,6 +220,75 @@ class MinHashLSHEnsemble:
         config["basename"] = b"-".join([basename, struct.pack(">H", partition), struct.pack(">H", r)])
         return config
 
+    def _create_indexes(self, basename: Optional[bytes] = None):
+        if basename is None:
+            basename = _random_name(11)
+        return [
+            dict(
+                (
+                    r,
+                    MinHashLSH(
+                        num_perm=self.h,
+                        params=(int(self.h / r), r),
+                        storage_config=self._get_storage_config(
+                            basename, self._storage_config, partition, r
+                        ),
+                        prepickle=self._prepickle,
+                    ),
+                )
+                for r in self._rs
+            )
+            for partition in range(self.num_part)
+        ]
+
+    def _build_indexes(
+        self, entries: list[tuple[Hashable, MinHash, int]]
+    ) -> tuple[list, list[Optional[int]], list[Optional[int]], Optional[MinHashDigest]]:
+        indexes = self._create_indexes()
+        lowers: list[Optional[int]] = [None for _ in indexes]
+        uppers: list[Optional[int]] = [None for _ in indexes]
+        if not entries:
+            return indexes, lowers, uppers, None
+
+        digest = None
+        for _key, minhash, _size in entries:
+            digest = _check_minhash_digest(minhash, self.h, digest)
+
+        sizes, counts = np.array(sorted(Counter(size for _key, _minhash, size in entries).most_common())).T
+        partitions = optimal_partitions(sizes, counts, len(indexes))
+        for i, (lower, upper) in enumerate(partitions):
+            lowers[i], uppers[i] = int(lower), int(upper)
+
+        ordered_entries = sorted(entries, key=lambda entry: entry[2])
+        curr_part = 0
+        for key, minhash, size in ordered_entries:
+            upper = uppers[curr_part]
+            if upper is not None and size > upper:
+                curr_part += 1
+            for r in indexes[curr_part]:
+                indexes[curr_part][r].insert(key, minhash)
+        return indexes, lowers, uppers, digest
+
+    def _materialize_entries(
+        self, entries: Iterable[tuple[Hashable, MinHash, int]]
+    ) -> list[tuple[Hashable, MinHash, int]]:
+        materialized = []
+        seen = set()
+        for key, minhash, size in entries:
+            if key in seen:
+                raise ValueError("Duplicate key %r in entries" % (key,))
+            seen.add(key)
+            size = _validate_size(size)
+            _check_minhash_digest(minhash, self.h)
+            materialized.append((key, minhash.copy(), size))
+        return materialized
+
+    def update_session(self) -> "MinHashLSHEnsembleUpdateSession":
+        """Create a transactional session for adding, removing, and replacing entries."""
+        if self._storage_config.get("type") != "dict":
+            raise ValueError("update_session is only supported for in-memory dict storage")
+        return MinHashLSHEnsembleUpdateSession(self)
+
     def index(self, entries: Iterable[tuple[Hashable, MinHash, int]]) -> None:
         """Index all sets given their keys, MinHashes, and sizes.
         It can be called only once after the index is created.
@@ -198,34 +301,22 @@ class MinHashLSHEnsemble:
                 and ``size`` is the size or number of unique items in the set.
 
         Raises:
-            ValueError: If the index is not empty or ``entries`` is empty.
+            ValueError: If the index has already been initialized or ``entries`` is empty.
 
         """
-        if not self.is_empty():
-            raise ValueError("Cannot call index again on a non-empty index")
-        if not isinstance(entries, list):
-            queue = deque()
-            for key, minhash, size in entries:
-                if size <= 0:
-                    raise ValueError("Set size must be positive")
-                queue.append((key, minhash, size))
-            entries = list(queue)
+        if self._index_initialized:
+            raise ValueError("Cannot call index again after the index has been initialized")
+        entries = self._materialize_entries(entries)
         if len(entries) == 0:
             raise ValueError("entries is empty")
-        # Create optimal partitions.
-        sizes, counts = np.array(sorted(Counter(e[2] for e in entries).most_common())).T
-        partitions = optimal_partitions(sizes, counts, len(self.indexes))
-        for i, (lower, upper) in enumerate(partitions):
-            self.lowers[i], self.uppers[i] = lower, upper
-        # Insert into partitions.
-        entries.sort(key=lambda e: e[2])
-        curr_part = 0
-        for key, minhash, size in entries:
-            u = self.uppers[curr_part]
-            if size > u:
-                curr_part += 1
-            for r in self.indexes[curr_part]:
-                self.indexes[curr_part][r].insert(key, minhash)
+        indexes, lowers, uppers, digest = self._build_indexes(entries)
+        self.indexes = indexes
+        self.lowers = lowers
+        self.uppers = uppers
+        if self._storage_config.get("type") == "dict":
+            self._entries = {key: (minhash, size) for key, minhash, size in entries}
+        self._minhash_digest = digest
+        self._index_initialized = True
 
     def query(self, minhash: MinHash, size: int) -> Generator[Hashable, None, None]:
         """Giving the MinHash and size of the query set, retrieve
@@ -240,16 +331,13 @@ class MinHashLSHEnsemble:
             Generator[Hashable, None, None]: an iterator of keys.
 
         """
+        size = _validate_size(size)
+        _check_minhash_digest(minhash, self.h, self._minhash_digest)
         for i, index in enumerate(self.indexes):
             u = self.uppers[i]
             if u is None:
                 continue
             b, r = self._get_optimal_param(u, size)
-            # The permutation-scheme guard lives in the inner MinHashLSH
-            # (_query_b calls _check_scheme_consistency), so it is checked
-            # lazily as this generator is iterated and only for partitions
-            # that have had an insert. A query reaching only empty partitions
-            # returns nothing regardless, so it cannot yield wrong results.
             for key in index[r]._query_b(minhash, b):
                 yield key
 
@@ -269,6 +357,106 @@ class MinHashLSHEnsemble:
 
         """
         return all(all(index[r].is_empty() for r in index) for index in self.indexes)
+
+
+class MinHashLSHEnsembleUpdateSession:
+    """Transactional update session for a memory-backed :class:`MinHashLSHEnsemble`.
+
+    Changes are held in a private snapshot and do not affect queries until
+    :meth:`commit` succeeds. Multiple changes to the same key collapse in call
+    order. Leaving a ``with`` block without committing cancels the session.
+    """
+
+    def __init__(self, ensemble: MinHashLSHEnsemble) -> None:
+        self.ensemble = ensemble
+        self._entries = dict(ensemble._entries)
+        self._digest_value = ensemble._minhash_digest
+        self._closed = False
+        self._committed = False
+
+    def __enter__(self) -> "MinHashLSHEnsembleUpdateSession":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if not self._committed:
+            self.cancel()
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("This update session is closed")
+
+    def _validate(self, minhash: MinHash, size: int) -> tuple[MinHash, int]:
+        _check_minhash_digest(minhash, self.ensemble.h)
+        return minhash.copy(), _validate_size(size)
+
+    def _set_entry(self, key: Hashable, minhash: MinHash, size: int, expected: bool) -> None:
+        exists = key in self._entries
+        if exists is not expected:
+            if expected:
+                raise ValueError("The given key does not exist")
+            raise ValueError("The given key already exists")
+        candidate = self._validate(minhash, size)
+        other_count = len(self._entries) - (1 if exists else 0)
+        if other_count:
+            _check_minhash_digest(minhash, self.ensemble.h, self._digest_value)
+        self._entries[key] = candidate
+        self._digest_value = _check_minhash_digest(minhash, self.ensemble.h)
+
+    def insert(self, key: Hashable, minhash: MinHash, size: int) -> None:
+        """Add a key that is not present in the session's dataset."""
+        self._ensure_open()
+        self._set_entry(key, minhash, size, expected=False)
+
+    def remove(self, key: Hashable) -> None:
+        """Remove a key from the session's dataset."""
+        self._ensure_open()
+        if key not in self._entries:
+            raise ValueError("The given key does not exist")
+        del self._entries[key]
+        if not self._entries:
+            self._digest_value = None
+
+    def replace(self, key: Hashable, minhash: MinHash, size: int) -> None:
+        """Replace the MinHash and size of an existing key."""
+        self._ensure_open()
+        self._set_entry(key, minhash, size, expected=True)
+
+    def update(self, key: Hashable, minhash: MinHash, size: int) -> None:
+        """Replace the MinHash and size of an existing key."""
+        self.replace(key, minhash, size)
+
+    def commit(self) -> None:
+        """Rebuild all partitions from the session's final in-memory dataset.
+
+        The old partitions remain available while new partitions are built. They
+        are replaced only after every entry is inserted, so a failed commit
+        leaves the old index complete and queryable.
+        """
+        self._ensure_open()
+        entries = [(key, minhash, size) for key, (minhash, size) in self._entries.items()]
+        digest = None
+        for _key, minhash, _size in entries:
+            digest = _check_minhash_digest(minhash, self.ensemble.h, digest)
+        indexes, lowers, uppers, digest = self.ensemble._build_indexes(entries)
+        self.ensemble.indexes = indexes
+        self.ensemble.lowers = lowers
+        self.ensemble.uppers = uppers
+        self.ensemble._entries = dict(self._entries)
+        self.ensemble._minhash_digest = digest
+        self.ensemble._index_initialized = True
+        self._closed = True
+        self._committed = True
+
+    def rollback(self) -> None:
+        """Discard all changes made in this session."""
+        self.cancel()
+
+    def cancel(self) -> None:
+        """Discard all changes made in this session."""
+        if self._closed:
+            return
+        self._entries.clear()
+        self._closed = True
 
 
 if __name__ == "__main__":

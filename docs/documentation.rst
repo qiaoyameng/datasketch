@@ -70,6 +70,9 @@ MinHash LSH Ensemble
     :members:
     :special-members:
 
+.. autoclass:: datasketch.MinHashLSHEnsembleUpdateSession
+    :members:
+
 HyperLogLog
 -----------
 

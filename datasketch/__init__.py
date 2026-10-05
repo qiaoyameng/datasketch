@@ -15,7 +15,7 @@ from datasketch.hyperloglog import HyperLogLog, HyperLogLogPlusPlus
 from datasketch.lean_minhash import LeanMinHash
 from datasketch.lsh import MinHashLSH
 from datasketch.lsh_bloom import MinHashLSHBloom
-from datasketch.lshensemble import MinHashLSHEnsemble
+from datasketch.lshensemble import MinHashLSHEnsemble, MinHashLSHEnsembleUpdateSession
 from datasketch.lshforest import MinHashLSHForest
 from datasketch.minhash import MinHash
 from datasketch.weighted_minhash import WeightedMinHash, WeightedMinHashGenerator
@@ -34,6 +34,7 @@ __all__ = [
     "MinHashLSH",
     "MinHashLSHBloom",
     "MinHashLSHEnsemble",
+    "MinHashLSHEnsembleUpdateSession",
     "MinHashLSHForest",
     "WeightedMinHash",
     "WeightedMinHashGenerator",
