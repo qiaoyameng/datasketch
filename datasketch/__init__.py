@@ -15,6 +15,12 @@ from datasketch.hyperloglog import HyperLogLog, HyperLogLogPlusPlus
 from datasketch.lean_minhash import LeanMinHash
 from datasketch.lsh import MinHashLSH
 from datasketch.lsh_bloom import MinHashLSHBloom
+from datasketch.lsh_calibration import (
+    LSHCalibrationPair,
+    LSHCalibrationResult,
+    LSHParamScore,
+    calibrate_lsh_params,
+)
 from datasketch.lshensemble import MinHashLSHEnsemble
 from datasketch.lshforest import MinHashLSHForest
 from datasketch.minhash import MinHash
@@ -40,6 +46,10 @@ __all__ = [
     "WeightedMinHashLSH",
     "WeightedMinHashLSHForest",
     "bBitMinHash",
+    "calibrate_lsh_params",
+    "LSHCalibrationPair",
+    "LSHCalibrationResult",
+    "LSHParamScore",
     "sha1_hash32",
     "sha1_hash64",
 ]

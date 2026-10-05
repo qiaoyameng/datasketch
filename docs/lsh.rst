@@ -190,6 +190,46 @@ query, e.g. with ``MinHash.jaccard`` or the exact similarity of the
 original sets; the left tail of the curves above is precisely the set of
 false candidates such a check removes.
 
+.. _minhash_lsh_calibration:
+
+Calibrating (b, r) on labeled pairs
+-----------------------------------
+
+The built-in optimizer targets a generic similarity distribution. If you
+have sample pairs labeled as *should recall* or *should exclude*,
+``calibrate_lsh_params`` evaluates every legal ``(b, r)`` combination
+within the permutation budget (``b * r <= num_perm``) directly on your
+data and picks the one with the lowest weighted expected loss. It is an
+offline tool: it never creates or modifies an index, and returns the
+recommended parameters together with the full scoring table.
+
+.. code:: python
+
+    from datasketch import calibrate_lsh_params
+
+    # Each pair: (query_minhash, candidate_minhash, should_recall, weight).
+    result = calibrate_lsh_params(
+        train_pairs,
+        num_perm=128,
+        miss_cost=5.0,          # cost of missing a should-recall pair
+        false_alarm_cost=1.0,   # cost of recalling a should-exclude pair
+        validation_pairs=validation_pairs,  # held-out split, optional
+    )
+    print(result.params)                # recommended (b, r)
+    print(result.unused_permutations)   # num_perm - b * r
+    print(result.train.expected_loss)   # loss on the training split
+    print(result.validation.expected_loss)  # loss on the held-out split
+
+Keep the training and validation splits separate: ``result.train`` shows
+the loss of the chosen parameters on the data they were selected on,
+while ``result.validation`` scores the same parameters on held-out pairs
+and ``result.validation_best`` shows the best achievable loss there, so
+overfitting is visible instead of hidden behind training numbers. The
+full per-combination tables are in ``result.train_scores`` and
+``result.validation_scores``. To apply the recommendation, rebuild an
+index with ``MinHashLSH(num_perm=..., params=result.params)`` --
+existing indexes are never touched.
+
 .. _minhash_lsh_at_scale:
 
 MinHash LSH at scale
