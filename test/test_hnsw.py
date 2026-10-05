@@ -250,6 +250,96 @@ class TestHNSW(unittest.TestCase):
         self.assertRaises(KeyError, hnsw.popitem)
         self.assertRaises(ValueError, hnsw.query, data[0])
 
+    def test_query_filter_traverses_unqualified_nodes(self):
+        # A small 1-D graph in which the only qualifying point is the
+        # farthest one: the search must navigate through unqualified
+        # nodes to reach it.
+        points = [np.array([float(i)]) for i in range(1, 11)]
+        index = HNSW(distance_func=l2_distance, m=4, ef_construction=50, seed=42)
+        for key, point in enumerate(points):
+            index.insert(key, point)
+        results = index.query(np.array([0.0]), k=3, ef=10, filter_func=lambda key: key == 9)
+        self.assertEqual([key for key, _ in results], [9])
+        self.assertAlmostEqual(results[0][1], 10.0)
+        # All reachable nodes were explored, so the search did not stop
+        # early even though fewer than k results qualify.
+        self.assertFalse(results.stopped_early)
+
+    def test_query_filter_budget_exhaustion(self):
+        # Many unqualified points near the query exhaust the candidate
+        # budget before any qualifying point is reached.
+        points = [np.array([float(i)]) for i in range(1, 21)]
+        index = HNSW(distance_func=l2_distance, m=4, ef_construction=50, seed=42)
+        for key, point in enumerate(points):
+            index.insert(key, point)
+        qualifying = set(range(15, 20))
+        filter_func = lambda key: key in qualifying
+        # With a small ef, the budget is spent on closer unqualified points.
+        results = index.query(np.array([0.0]), k=3, ef=5, filter_func=filter_func)
+        self.assertLess(len(results), 3)
+        self.assertTrue(results.stopped_early)
+        # With a large enough budget, the qualifying points are found.
+        results = index.query(np.array([0.0]), k=3, ef=20, filter_func=filter_func)
+        self.assertEqual([key for key, _ in results], [15, 16, 17])
+        self.assertFalse(results.stopped_early)
+
+    def test_query_filter_matches_exhaustive_search(self):
+        rng = np.random.RandomState(42)
+        data = rng.random_sample((200, 8))
+        index = HNSW(distance_func=l2_distance, m=16, ef_construction=100, seed=42)
+        index.update({i: data[i] for i in range(len(data))})
+        allowed = set(range(0, len(data), 3))
+        k = 10
+        for query_point in data[:10]:
+            results = index.query(query_point, k=k, ef=len(data), filter_func=lambda key: key in allowed)
+            expected = sorted(
+                ((key, l2_distance(query_point, data[key])) for key in allowed),
+                key=lambda item: item[1],
+            )[:k]
+            self.assertEqual([key for key, _ in results], [key for key, _ in expected])
+            for (_, dist), (_, expected_dist) in zip(results, expected):
+                self.assertAlmostEqual(dist, expected_dist)
+        # Without k, all qualifying neighbors are returned.
+        results = index.query(data[0], ef=len(data), filter_func=lambda key: key in allowed)
+        expected = sorted(
+            ((key, l2_distance(data[0], data[key])) for key in allowed),
+            key=lambda item: item[1],
+        )
+        self.assertEqual(len(results), len(allowed))
+        self.assertEqual([key for key, _ in results], [key for key, _ in expected])
+
+    def test_query_without_filter_unchanged(self):
+        data = self._create_random_points()
+        index = self._create_index(data)
+        for query_point in data[:10]:
+            expected = index.query(query_point, 10)
+            self.assertIsInstance(expected, list)
+            self.assertEqual(expected, index.query(query_point, 10, filter_func=None))
+            self.assertEqual(expected, index.query(query_point, 10, filter_func=lambda key: True))
+
+    def test_query_filter_excludes_soft_removed(self):
+        data = self._create_random_points()
+        index = self._create_index(data)
+        index.remove(0)
+        results = index.query(data[0], 10, filter_func=lambda key: True)
+        self.assertNotIn(0, [key for key, _ in results])
+
+    def test_query_tied_distances_with_unorderable_keys(self):
+        # Mixed-type keys cannot be ordered; equal distances must not
+        # trigger comparisons between keys.
+        keys = [0, "a", 1, "b", 2, "c", 3, "d"]
+        index = HNSW(distance_func=l2_distance, m=4, ef_construction=10, seed=42)
+        for key in keys:
+            index.insert(key, np.zeros(2))
+        results = index.query(np.zeros(2), k=4)
+        self.assertEqual(len(results), 4)
+        results = index.query(np.zeros(2), k=4, filter_func=lambda key: isinstance(key, str))
+        self.assertEqual(sorted(key for key, _ in results), ["a", "b", "c", "d"])
+        # Update a point to trigger graph repair with tied distances.
+        index[0] = np.array([1.0, 1.0])
+        results = index.query(np.zeros(2), k=4)
+        self.assertEqual(len(results), 4)
+
 
 class TestHNSWLayerWithReversedEdges(TestHNSW):
     def _create_index(self, vecs, keys=None):

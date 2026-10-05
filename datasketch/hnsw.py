@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import itertools
 from collections import OrderedDict
 from collections.abc import Hashable, Iterable, Iterator, Mapping, MutableMapping
 from typing import (
@@ -141,6 +142,27 @@ class _Node:
 
     def copy(self) -> _Node:
         return _Node(self.key, self.point, self.is_deleted)
+
+
+class QueryResult(list):
+    """The result of :meth:`HNSW.query`: a list of (key, distance) pairs
+    sorted by ascending distance, with additional search metadata.
+
+    Attributes:
+        stopped_early (bool): True if the search terminated because the
+            candidate budget (``ef``) was exhausted before the requested
+            number of qualifying results was found; increasing ``ef`` may
+            yield more results. False if the requested number of results
+            was found or the search space was fully explored.
+
+    """
+
+    def __init__(self, items: Iterable = (), stopped_early: bool = False) -> None:
+        super().__init__(items)
+        self.stopped_early = stopped_early
+
+    def __repr__(self) -> str:
+        return f"QueryResult({list.__repr__(self)}, stopped_early={self.stopped_early})"
 
 
 class HNSW(MutableMapping):
@@ -492,7 +514,7 @@ class HNSW(MutableMapping):
                 level_m = self._m if layer is not self._graphs[0] else self._m0
                 # Search this layer for neighbors to insert, and update entry points
                 # for the next level.
-                entry_points = self._search_base_layer(new_point, entry_points, layer, ef, allow_soft_deleted=True)
+                entry_points, _ = self._search_base_layer(new_point, entry_points, layer, ef, allow_soft_deleted=True)
                 # Insert the new node into the graph with out-going edges.
                 # We prune the out-going edges to keep only the top level_m neighbors.
                 layer[key] = {
@@ -549,16 +571,19 @@ class HNSW(MutableMapping):
                 # For each neighbor of the key, we connects it with the top ef
                 # neighbors in the 2nd-degree neighborhood of the key.
                 cands = []
+                # A monotonically increasing tie-breaker is used in the heap
+                # entries to avoid comparing keys when distances are equal.
+                tie_breaker = itertools.count()
                 elem_to_keep = min(ef, len(neighborhood_keys) - 1)
                 for candidate_key in neighborhood_keys:
                     if candidate_key == p:
                         continue
                     dist = self._distance_func(self._nodes[candidate_key].point, self._nodes[p].point)
                     if len(cands) < elem_to_keep:
-                        heapq.heappush(cands, (-dist, candidate_key))
+                        heapq.heappush(cands, (-dist, next(tie_breaker), candidate_key))
                     elif dist < -cands[0][0]:
-                        heapq.heappushpop(cands, (-dist, candidate_key))
-                layer[p] = {p2: d2 for d2, p2 in self._heuristic_prune([(-md, p) for md, p in cands], layer_m)}
+                        heapq.heappushpop(cands, (-dist, next(tie_breaker), candidate_key))
+                layer[p] = {p2: d2 for d2, p2 in self._heuristic_prune([(-md, p) for md, _, p in cands], layer_m)}
         self._repair_connections(key, new_point, ef)
 
     def _repair_connections(
@@ -587,7 +612,7 @@ class HNSW(MutableMapping):
             else:
                 # Search for the neighbors at this layer using ef search.
                 level_m = self._m if layer is not self._graphs[0] else self._m0
-                entry_points = self._search_base_layer(
+                entry_points, _ = self._search_base_layer(
                     new_point,
                     entry_points,
                     layer,
@@ -607,7 +632,8 @@ class HNSW(MutableMapping):
         query_point: np.ndarray,
         k: Optional[int] = None,
         ef: Optional[int] = None,
-    ) -> list[tuple[Hashable, float]]:
+        filter_func: Optional[Callable[[Hashable], bool]] = None,
+    ) -> QueryResult:
         """Search for the k nearest neighbors of the query point.
 
         Args:
@@ -616,10 +642,20 @@ class HNSW(MutableMapping):
                 all neighbors found.
             ef (Optional[int]): The number of neighbors to consider during search.
                 If None, use the construction ef.
+            filter_func (Optional[Callable[[Hashable], bool]]): A function that
+                takes a key and returns True if the key is eligible to be
+                returned as a result. The filter only determines whether a
+                node can be returned as a result; nodes rejected by the
+                filter (as well as soft-deleted nodes) are still used for
+                graph navigation. If None, all nodes are eligible.
 
         Returns:
-            list[Tuple[Hashable, float]]: A list of (key, distance) pairs for the k
-                nearest neighbors of the query point.
+            QueryResult: A list of (key, distance) pairs for the k nearest
+                neighbors of the query point. If fewer than k neighbors
+                qualify, only those are returned; the ``stopped_early``
+                attribute indicates whether the search stopped because the
+                candidate budget (``ef``) was exhausted before k qualifying
+                neighbors were found.
 
         Raises:
             ValueError: If the entry point is not found.
@@ -636,15 +672,26 @@ class HNSW(MutableMapping):
         for layer in reversed(self._graphs[1:]):
             entry_point, entry_point_dist = self._search_ef1(query_point, entry_point, entry_point_dist, layer)
         # Search for the neighbors at the base layer using ef search.
-        candidates = self._search_base_layer(query_point, [(-entry_point_dist, entry_point)], self._graphs[0], ef)
+        candidates, budget_exhausted = self._search_base_layer(
+            query_point, [(-entry_point_dist, entry_point)], self._graphs[0], ef
+        )
+        if filter_func is not None:
+            # The filter only decides whether a candidate can be returned as
+            # a result; it does not affect the search itself.
+            candidates = [candidate for candidate in candidates if filter_func(candidate[1])]
         if k is not None:
             # If k is specified, we return the k nearest neighbors.
-            candidates = heapq.nlargest(k, candidates)
+            stopped_early = budget_exhausted and len(candidates) < k
+            candidates = heapq.nlargest(k, candidates, key=lambda candidate: candidate[0])
         else:
             # Otherwise, we return all neighbors found.
-            candidates.sort(reverse=True)
+            stopped_early = budget_exhausted
+            candidates.sort(key=lambda candidate: candidate[0], reverse=True)
         # Return the neighbors as a list of (id, distance) pairs.
-        return [(key, -mdist) for mdist, key in candidates]
+        return QueryResult(
+            [(key, -mdist) for mdist, key in candidates],
+            stopped_early=stopped_early,
+        )
 
     def _search_ef1(
         self,
@@ -673,13 +720,16 @@ class HNSW(MutableMapping):
                 neighbor found.
 
         """
-        candidates = [(entry_point_dist, entry_point)]
+        # A monotonically increasing tie-breaker is used in the heap entries
+        # to avoid comparing keys when distances are equal.
+        tie_breaker = itertools.count()
+        candidates = [(entry_point_dist, next(tie_breaker), entry_point)]
         visited = set([entry_point])
         best = entry_point
         best_dist = entry_point_dist
         while candidates:
             # Pop the closest node from the heap.
-            dist, curr = heapq.heappop(candidates)
+            dist, _, curr = heapq.heappop(candidates)
             if dist > best_dist:
                 # Terminate the search if the distance to the current closest node
                 # is larger than the distance to the best node.
@@ -699,7 +749,7 @@ class HNSW(MutableMapping):
                     else:
                         best, best_dist = p, d
                     # Add the neighbor to the heap.
-                    heapq.heappush(candidates, (d, p))
+                    heapq.heappush(candidates, (d, next(tie_breaker), p))
         return best, best_dist
 
     def _search_base_layer(
@@ -710,7 +760,7 @@ class HNSW(MutableMapping):
         ef: int,
         allow_soft_deleted: bool = False,
         key_to_hard_delete: Optional[Hashable] = None,
-    ) -> list[tuple[float, Hashable]]:
+    ) -> tuple[list[tuple[float, Hashable]], bool]:
         """The ef search algorithm for finding neighbors in a given layer.
 
         Args:
@@ -725,8 +775,13 @@ class HNSW(MutableMapping):
                 hard-deleted, if any. This point should never be returned.
 
         Returns:
-            list[Tuple[float, Hashable]]: A heap of (-distance, key) pairs representing
-                the neighbors found.
+            Tuple[list[Tuple[float, Hashable]], bool]: A tuple of
+
+                * a list of (-distance, key) pairs representing the neighbors
+                  found, and
+                * a boolean indicating whether the search terminated because
+                  the candidate budget (ef) limited exploration; if True,
+                  a larger ef may yield more neighbors.
 
         Note:
             When used together with :meth:`_search_ef1`, the input entry_points
@@ -737,21 +792,29 @@ class HNSW(MutableMapping):
             points if necessary.
 
         """
-        # candidates is a heap of (distance, key) pairs.
-        candidates = [(-mdist, p) for mdist, p in entry_points]
+        # A monotonically increasing tie-breaker is used in the heap entries
+        # to avoid comparing keys when distances are equal.
+        tie_breaker = itertools.count()
+        # candidates is a heap of (distance, tie-breaker, key) pairs.
+        candidates = [(-mdist, next(tie_breaker), p) for mdist, p in entry_points]
         heapq.heapify(candidates)
+        # entry_points is a heap of (-distance, tie-breaker, key) pairs.
+        entry_points = [(mdist, next(tie_breaker), p) for mdist, p in entry_points]
+        heapq.heapify(entry_points)
 
-        visited = set(p for _, p in entry_points)
+        visited = set(p for _, _, p in entry_points)
+        budget_exhausted = False
         while candidates:
             # Pop the closest node from the heap.
-            dist, curr_key = heapq.heappop(candidates)
-
-            # If the neighbor has been marked as deleted, we ,
+            dist, _, curr_key = heapq.heappop(candidates)
 
             # Terminate the search if the distance to the current closest node
             # is larger than the distance to the best node.
             closet_dist = -entry_points[0][0]
             if dist > closet_dist:
+                # The search is limited by the candidate budget: a larger ef
+                # may yield more neighbors.
+                budget_exhausted = len(entry_points) >= ef
                 break
             # Find the neighbors of the current node
             neighbors = [p for p in layer[curr_key] if p not in visited]
@@ -763,21 +826,29 @@ class HNSW(MutableMapping):
                         # If the neighbor has been deleted or to be deleted,
                         # we add it to the heap to explore its neighbors but
                         # do not add it to the entry points.
-                        heapq.heappush(candidates, (dist, p))
+                        heapq.heappush(candidates, (dist, next(tie_breaker), p))
+                    elif len(entry_points) >= ef:
+                        # The neighbor is beyond the distance window imposed
+                        # by the full candidate budget.
+                        budget_exhausted = True
                 elif len(entry_points) < ef:
-                    heapq.heappush(candidates, (dist, p))
                     # If we have not found enough neighbors, we add the neighbor
                     # to the heap.
-                    heapq.heappush(entry_points, (-dist, p))
+                    heapq.heappush(candidates, (dist, next(tie_breaker), p))
+                    heapq.heappush(entry_points, (-dist, next(tie_breaker), p))
                     closet_dist = -entry_points[0][0]
                 elif dist <= closet_dist:
-                    heapq.heappush(candidates, (dist, p))
                     # If we have found enough neighbors, we replace the worst
                     # neighbor with the neighbor if the neighbor is closer.
-                    heapq.heapreplace(entry_points, (-dist, p))
+                    heapq.heappush(candidates, (dist, next(tie_breaker), p))
+                    heapq.heapreplace(entry_points, (-dist, next(tie_breaker), p))
                     closet_dist = -entry_points[0][0]
+                else:
+                    # The neighbor is beyond the distance window imposed by
+                    # the full candidate budget.
+                    budget_exhausted = True
 
-        return entry_points
+        return [(mdist, p) for mdist, _, p in entry_points], budget_exhausted
 
     def _heuristic_prune(self, candidates: list[tuple[float, Hashable]], max_size: int) -> list[tuple[float, Hashable]]:
         """Prune the potential neigbors to keep only the top max_size neighbors.
@@ -798,14 +869,16 @@ class HNSW(MutableMapping):
             # If the number of entry points is smaller than max_size, we return
             # all entry points.
             return candidates
-        # candidates is a heap of (distance, key) pairs.
-        heapq.heapify(candidates)
+        # Decorate the candidates with a monotonically increasing tie-breaker
+        # to avoid comparing keys when distances are equal.
+        heap = [(dist, i, key) for i, (dist, key) in enumerate(candidates)]
+        heapq.heapify(heap)
         pruned = []
-        while candidates:
+        while heap:
             if len(pruned) >= max_size:
                 break
             # Pop the closest node from the heap.
-            candidate_dist, candidate_key = heapq.heappop(candidates)
+            candidate_dist, _, candidate_key = heapq.heappop(heap)
             good = True
             for _, selected_key in pruned:
                 dist_to_selected_neighbor = self._distance_func(
